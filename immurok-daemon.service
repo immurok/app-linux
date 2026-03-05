@@ -1,0 +1,12 @@
+[Unit]
+Description=immurok BLE 指纹认证服务
+After=bluetooth.target dbus.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/immurok-daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

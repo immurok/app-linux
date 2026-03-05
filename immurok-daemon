@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""immurok daemon 入口"""
+
+import asyncio
+from immurok.daemon import main
+
+asyncio.run(main())

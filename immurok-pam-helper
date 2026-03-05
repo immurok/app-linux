@@ -1,0 +1,113 @@
+#!/bin/bash
+#
+# immurok PAM 配置助手 — 通过 pkexec 以 root 运行
+#
+# 用法: immurok-pam-helper add <service>
+#        immurok-pam-helper remove <service>
+#
+# service: sudo | gdm-password | polkit-1
+#
+set -e
+
+PAM_LINE="auth        sufficient    pam_immurok.so"
+
+# polkit-1 文件不存在时需要创建完整模板
+POLKIT_TEMPLATE="#%PAM-1.0
+# Created by immurok
+auth        sufficient    pam_immurok.so timeout=10
+auth        include       password-auth
+account     include       password-auth
+password    include       password-auth
+session     include       password-auth"
+
+# ── PAM 模块目录检测 ─────────────────────────────────────────
+pam_module_dir() {
+    for d in /usr/lib64/security /lib/aarch64-linux-gnu/security \
+             /lib/x86_64-linux-gnu/security /lib/security; do
+        [ -d "$d" ] && echo "$d" && return
+    done
+    echo "/usr/lib/security"
+}
+
+check_module() {
+    PAM_DIR=$(pam_module_dir)
+    if [ ! -f "$PAM_DIR/pam_immurok.so" ]; then
+        echo "ERROR:MODULE_NOT_INSTALLED"
+        exit 1
+    fi
+}
+
+# ── 参数校验 ─────────────────────────────────────────────────
+ACTION="$1"
+SERVICE="$2"
+
+case "$SERVICE" in
+    sudo|gdm-password|polkit-1) ;;
+    *) echo "ERROR:INVALID_SERVICE"; exit 1 ;;
+esac
+
+PAM_FILE="/etc/pam.d/$SERVICE"
+
+# ── 操作 ─────────────────────────────────────────────────────
+case "$ACTION" in
+    add)
+        check_module
+
+        # polkit-1: 文件不存在则创建完整模板
+        if [ "$SERVICE" = "polkit-1" ] && [ ! -f "$PAM_FILE" ]; then
+            echo "$POLKIT_TEMPLATE" > "$PAM_FILE"
+            chmod 644 "$PAM_FILE"
+            echo "OK:CREATED"
+            exit 0
+        fi
+
+        if [ ! -f "$PAM_FILE" ]; then
+            echo "ERROR:FILE_NOT_FOUND"
+            exit 1
+        fi
+
+        # 幂等: 已存在则跳过
+        if grep -q 'pam_immurok\.so' "$PAM_FILE"; then
+            echo "OK:ALREADY_PRESENT"
+            exit 0
+        fi
+
+        # 在第一行 auth 之前插入
+        first_auth=$(grep -n '^auth' "$PAM_FILE" | head -1 | cut -d: -f1)
+        if [ -z "$first_auth" ]; then
+            echo "ERROR:NO_AUTH_LINE"
+            exit 1
+        fi
+
+        sed -i "${first_auth}i\\${PAM_LINE}" "$PAM_FILE"
+        echo "OK:ADDED"
+        ;;
+
+    remove)
+        if [ ! -f "$PAM_FILE" ]; then
+            echo "OK:NOT_PRESENT"
+            exit 0
+        fi
+
+        # 幂等: 不存在则跳过
+        if ! grep -q 'pam_immurok\.so' "$PAM_FILE"; then
+            echo "OK:NOT_PRESENT"
+            exit 0
+        fi
+
+        # polkit-1: 如果是我们创建的，直接删除文件
+        if [ "$SERVICE" = "polkit-1" ] && grep -q 'Created by immurok' "$PAM_FILE"; then
+            rm -f "$PAM_FILE"
+            echo "OK:REMOVED"
+            exit 0
+        fi
+
+        sed -i '/pam_immurok\.so/d' "$PAM_FILE"
+        echo "OK:REMOVED"
+        ;;
+
+    *)
+        echo "ERROR:INVALID_ACTION"
+        exit 1
+        ;;
+esac

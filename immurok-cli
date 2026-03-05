@@ -1,0 +1,660 @@
+#!/usr/bin/env python3
+"""
+immurok TUI — 实时状态面板 + 键盘快捷键操作
+
+快捷键:
+  p  配对        u  解除配对
+  e  录入指纹    d  删除指纹
+  s  sudo 开关   o  polkit 开关
+  k  锁屏开关    l  查看日志
+  q  退出
+
+指纹匹配时对应槽位自动闪烁。
+"""
+
+import os
+import select
+import socket
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+
+from rich.console import Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.text import Text
+
+from immurok.config import (
+    ENROLL_CAPTURED,
+    ENROLL_COMPLETE,
+    ENROLL_FAILED,
+    ENROLL_LIFT_FINGER,
+    ENROLL_PROCESSING,
+    ENROLL_WAITING,
+    MAX_FINGERPRINT_SLOTS,
+    SOCKET_PATH,
+)
+
+ENROLL_EVENT_TEXT = {
+    ENROLL_WAITING: "请将手指放在传感器上",
+    ENROLL_CAPTURED: "已扫描",
+    ENROLL_PROCESSING: "处理中...",
+    ENROLL_LIFT_FINGER: "请抬起手指",
+    ENROLL_COMPLETE: "录入完成!",
+    ENROLL_FAILED: "录入失败",
+}
+
+# 闪烁持续时间 (秒)
+FLASH_DURATION = 3.0
+FLASH_INTERVAL = 0.3
+
+
+class ImmurokUI:
+    def __init__(self) -> None:
+        # 状态
+        self.ble_connected = False
+        self.ble_address = ""
+        self.paired = False
+        self.device_id = ""
+        self.fp_bitmap = 0
+        self.daemon_ok = False
+        self.unlock_sudo = True
+        self.unlock_polkit = True
+        self.unlock_screen = True
+        self.pam_sudo = False
+        self.pam_polkit = False
+        self.pam_screen = False
+
+        # 消息
+        self.message = "就绪"
+        self.message_style = "dim"
+
+        # 模式: normal / enroll_select / delete_select
+        self.mode = "normal"
+        self.busy = False
+        self.running = True
+
+        # 闪烁状态
+        self._flash_slot = -1
+        self._flash_until = 0.0
+
+    # ── Socket 通信 ────────────────────────────────────────────
+
+    def send(self, cmd: str, timeout: float = 5.0) -> str:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(SOCKET_PATH)
+            sock.sendall(cmd.encode("utf-8"))
+            data = sock.recv(256)
+            return data.decode("utf-8").strip()
+        except (FileNotFoundError, ConnectionRefusedError):
+            return "ERROR:DAEMON_NOT_RUNNING"
+        except socket.timeout:
+            return "ERROR:TIMEOUT"
+        finally:
+            sock.close()
+
+    # ── 状态刷新 ──────────────────────────────────────────────
+
+    def refresh(self) -> None:
+        # 连接状态
+        rsp = self.send("STATUS")
+        parts = rsp.split(":")
+        if parts[0] == "STATUS":
+            self.daemon_ok = True
+            self.ble_connected = parts[1] == "1" if len(parts) > 1 else False
+            self.ble_address = parts[2] if len(parts) > 2 else ""
+        else:
+            self.daemon_ok = False
+            self.ble_connected = False
+            self.ble_address = ""
+
+        # 配对状态
+        pair_rsp = self.send("PAIR:STATUS")
+        pair_parts = pair_rsp.split(":")
+        if len(pair_parts) >= 2 and pair_parts[1] == "PAIRED":
+            self.paired = True
+            self.device_id = pair_parts[2] if len(pair_parts) > 2 else ""
+        else:
+            self.paired = False
+            self.device_id = ""
+
+        # 指纹 bitmap
+        if self.ble_connected:
+            fp_rsp = self.send("FP:LIST")
+            fp_parts = fp_rsp.split(":")
+            if fp_parts[0] == "OK" and len(fp_parts) > 1:
+                try:
+                    self.fp_bitmap = int(fp_parts[1])
+                except ValueError:
+                    self.fp_bitmap = 0
+            else:
+                self.fp_bitmap = 0
+
+            # 检查是否有新的指纹匹配
+            match_rsp = self.send("FP:LAST_MATCH")
+            match_parts = match_rsp.split(":")
+            if match_parts[0] == "OK" and len(match_parts) > 1:
+                try:
+                    page_id = int(match_parts[1])
+                    if page_id >= 0:
+                        self._flash_slot = page_id
+                        self._flash_until = time.monotonic() + FLASH_DURATION
+                except ValueError:
+                    pass
+        else:
+            self.fp_bitmap = 0
+
+        # 设置状态
+        settings_rsp = self.send("GET:SETTINGS")
+        settings_parts = settings_rsp.split(":")
+        if settings_parts[0] == "OK" and len(settings_parts) >= 4:
+            for part in settings_parts[1:]:
+                if part.startswith("sudo="):
+                    self.unlock_sudo = part[5:] == "1"
+                elif part.startswith("polkit="):
+                    self.unlock_polkit = part[7:] == "1"
+                elif part.startswith("screen="):
+                    self.unlock_screen = part[7:] == "1"
+
+        # PAM 配置状态
+        self.pam_sudo = self._check_pam("sudo")
+        self.pam_polkit = self._check_pam("polkit-1")
+        self.pam_screen = self._check_pam("gdm-password")
+
+    # ── PAM 检测 ──────────────────────────────────────────────
+
+    @staticmethod
+    def _check_pam(service: str) -> bool:
+        """检查 /etc/pam.d/<service> 是否配置了 pam_immurok.so"""
+        try:
+            with open(f"/etc/pam.d/{service}") as f:
+                return "pam_immurok.so" in f.read()
+        except (FileNotFoundError, PermissionError):
+            return False
+
+    @staticmethod
+    def _find_pam_helper() -> str | None:
+        """查找 immurok-pam-helper 脚本路径"""
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        local = os.path.join(script_dir, "immurok-pam-helper")
+        if os.path.isfile(local):
+            return local
+        import shutil
+        return shutil.which("immurok-pam-helper")
+
+    def _run_pam_helper(self, action: str, service: str) -> str:
+        """通过 pkexec 运行 PAM helper，返回结果字符串"""
+        helper = self._find_pam_helper()
+        if not helper:
+            return "ERROR:HELPER_NOT_FOUND"
+        try:
+            result = subprocess.run(
+                ["pkexec", helper, action, service],
+                capture_output=True, text=True, timeout=60,
+            )
+            return result.stdout.strip() if result.returncode == 0 else "ERROR:PKEXEC_FAILED"
+        except subprocess.TimeoutExpired:
+            return "ERROR:TIMEOUT"
+        except FileNotFoundError:
+            return "ERROR:PKEXEC_NOT_FOUND"
+
+    # ── 渲染 ──────────────────────────────────────────────────
+
+    def _render_fp_slots(self) -> Text:
+        """渲染指纹槽位: [0:✅] [1:✅] [2:  ] ..."""
+        result = Text()
+        now = time.monotonic()
+        is_flashing = self._flash_slot >= 0 and now < self._flash_until
+        flash_visible = is_flashing and (int(now / FLASH_INTERVAL) % 2 == 0)
+
+        for i in range(MAX_FINGERPRINT_SLOTS):
+            has_fp = bool(self.fp_bitmap & (1 << i))
+            is_flash_target = is_flashing and i == self._flash_slot
+
+            if is_flash_target:
+                if flash_visible:
+                    result.append(f"[{i}:", style="dim")
+                    result.append("\u2705", style="bold green")
+                    result.append("]", style="dim")
+                else:
+                    result.append(f"[{i}:  ]", style="dim")
+            elif has_fp:
+                result.append(f"[{i}:", style="dim")
+                result.append("\u2705", style="")
+                result.append("]", style="dim")
+            else:
+                result.append(f"[{i}:  ]", style="dim")
+
+            if i < MAX_FINGERPRINT_SLOTS - 1:
+                result.append(" ")
+
+        return result
+
+    def render(self) -> Group:
+        lines = Text()
+
+        # BLE
+        lines.append("  BLE      ")
+        if not self.daemon_ok:
+            lines.append("\u2298 daemon \u672a\u8fd0\u884c", style="red")
+        elif self.ble_connected:
+            lines.append("\u25cf \u5df2\u8fde\u63a5", style="green bold")
+            lines.append(f"   {self.ble_address}", style="dim")
+        else:
+            lines.append("\u25cb \u672a\u8fde\u63a5", style="red")
+        lines.append("\n")
+
+        # 配对
+        lines.append("  \u914d\u5bf9     ")
+        if self.paired:
+            lines.append("\u25cf \u5df2\u914d\u5bf9", style="green bold")
+            id_short = self.device_id[:16] + "..." if len(self.device_id) > 16 else self.device_id
+            lines.append(f"   ({id_short})", style="dim")
+        else:
+            lines.append("\u25cb \u672a\u914d\u5bf9", style="yellow")
+        lines.append("\n")
+
+        # 指纹 — 槽位显示
+        lines.append("  \u6307\u7eb9     ")
+        if self.ble_connected:
+            fp_slots = self._render_fp_slots()
+            lines.append_text(fp_slots)
+        else:
+            lines.append("-", style="dim")
+        lines.append("\n")
+
+        # sudo 开关
+        lines.append("  sudo     ")
+        if self.unlock_sudo:
+            lines.append("\u25cf \u5df2\u542f\u7528", style="green bold")
+            if not self.pam_sudo:
+                lines.append("  PAM \u672a\u914d\u7f6e", style="yellow")
+        else:
+            lines.append("\u25cb \u5df2\u7981\u7528", style="red")
+        lines.append("\n")
+
+        # polkit 开关
+        lines.append("  polkit   ")
+        if self.unlock_polkit:
+            lines.append("\u25cf \u5df2\u542f\u7528", style="green bold")
+            if not self.pam_polkit:
+                lines.append("  PAM \u672a\u914d\u7f6e", style="yellow")
+        else:
+            lines.append("\u25cb \u5df2\u7981\u7528", style="red")
+        lines.append("\n")
+
+        # 锁屏开关
+        lines.append("  \u9501\u5c4f     ")
+        if self.unlock_screen:
+            lines.append("\u25cf \u5df2\u542f\u7528", style="green bold")
+            if not self.pam_screen:
+                lines.append("  PAM \u672a\u914d\u7f6e", style="yellow")
+        else:
+            lines.append("\u25cb \u5df2\u7981\u7528", style="red")
+
+        panel = Panel(lines, title="immurok", border_style="blue", padding=(1, 1))
+
+        # 快捷键栏
+        if self.mode == "normal":
+            keys = Text.assemble(
+                "  ", ("[p]", "bold cyan"), " \u914d\u5bf9  ",
+                ("[u]", "bold cyan"), " \u89e3\u9664  ",
+                ("[e]", "bold cyan"), " \u5f55\u5165  ",
+                ("[d]", "bold cyan"), " \u5220\u9664\n",
+                "  ", ("[s]", "bold cyan"), " sudo  ",
+                ("[o]", "bold cyan"), " polkit  ",
+                ("[k]", "bold cyan"), " \u9501\u5c4f\n",
+                "  ", ("[l]", "bold cyan"), " \u65e5\u5fd7  ",
+                ("[q]", "bold cyan"), " \u9000\u51fa",
+            )
+        elif self.mode in ("enroll_select", "delete_select"):
+            action = "\u5f55\u5165" if self.mode == "enroll_select" else "\u5220\u9664"
+            keys = Text(f"  \u6309 [0-{MAX_FINGERPRINT_SLOTS - 1}] \u9009\u62e9{action}\u69fd\u4f4d\uff0cEsc \u53d6\u6d88", style="yellow")
+        else:
+            keys = Text()
+
+        # 消息行
+        msg = Text(f"\n  {self.message}", style=self.message_style)
+
+        return Group(panel, keys, msg)
+
+    # ── 按键处理 ──────────────────────────────────────────────
+
+    def handle_key(self, key: str, live: Live) -> None:
+        if key == "q":
+            self.running = False
+            return
+
+        if self.busy:
+            return
+
+        if self.mode == "normal":
+            if key == "p":
+                self._start_thread(self.do_pair, live)
+            elif key == "u":
+                self.do_unpair(live)
+            elif key == "e":
+                if not self.ble_connected:
+                    self._set_msg("\u8bbe\u5907\u672a\u8fde\u63a5", "red bold")
+                    live.update(self.render())
+                    return
+                self.mode = "enroll_select"
+                self._set_msg(f"\u6309 0-{MAX_FINGERPRINT_SLOTS - 1} \u9009\u62e9\u5f55\u5165\u69fd\u4f4d", "yellow")
+                live.update(self.render())
+            elif key == "d":
+                if not self.ble_connected:
+                    self._set_msg("\u8bbe\u5907\u672a\u8fde\u63a5", "red bold")
+                    live.update(self.render())
+                    return
+                self.mode = "delete_select"
+                self._set_msg(f"\u6309 0-{MAX_FINGERPRINT_SLOTS - 1} \u9009\u62e9\u5220\u9664\u69fd\u4f4d", "yellow")
+                live.update(self.render())
+            elif key == "s":
+                self._start_thread(self.do_toggle_sudo, live)
+            elif key == "o":
+                self._start_thread(self.do_toggle_polkit, live)
+            elif key == "k":
+                self._start_thread(self.do_toggle_screen, live)
+            elif key == "l":
+                self.do_logs(live)
+
+        elif self.mode == "enroll_select":
+            if key == "\x1b":  # Esc
+                self.mode = "normal"
+                self._set_msg("\u5c31\u7eea", "dim")
+                live.update(self.render())
+            elif key.isdigit() and int(key) < MAX_FINGERPRINT_SLOTS:
+                slot = int(key)
+                self.mode = "normal"
+                self._start_thread(self.do_enroll, live, slot)
+
+        elif self.mode == "delete_select":
+            if key == "\x1b":  # Esc
+                self.mode = "normal"
+                self._set_msg("\u5c31\u7eea", "dim")
+                live.update(self.render())
+            elif key.isdigit() and int(key) < MAX_FINGERPRINT_SLOTS:
+                slot = int(key)
+                self.mode = "normal"
+                self.do_delete(slot, live)
+
+    # ── 操作 ──────────────────────────────────────────────────
+
+    def do_pair(self, live: Live) -> None:
+        self.busy = True
+        if self.paired:
+            self._set_msg("已配对，请先解除配对", "yellow bold")
+            live.update(self.render())
+            self.busy = False
+            return
+        if not self.ble_connected:
+            self._set_msg("设备未连接", "red bold")
+            live.update(self.render())
+            self.busy = False
+            return
+
+        self._set_msg("配对中... 请按设备按钮", "yellow bold")
+        live.update(self.render())
+
+        rsp = self.send("PAIR:START", timeout=65.0)
+        if rsp == "OK:PAIRED":
+            self._set_msg("配对成功!", "green bold")
+        else:
+            self._set_msg(f"配对失败: {rsp}", "red bold")
+        self.refresh()
+        live.update(self.render())
+        self.busy = False
+
+    def do_unpair(self, live: Live) -> None:
+        self.busy = True
+        self._set_msg("解除配对中...", "yellow bold")
+        live.update(self.render())
+
+        rsp = self.send("PAIR:RESET", timeout=10.0)
+        if rsp == "OK:RESET":
+            self._set_msg("配对已解除", "green bold")
+        else:
+            self._set_msg(f"解除失败: {rsp}", "red bold")
+        self.refresh()
+        live.update(self.render())
+        self.busy = False
+
+    def do_enroll(self, live: Live, slot: int) -> None:
+        self.busy = True
+        self._set_msg(f"录入槽位 {slot}... 请将手指放在传感器上", "yellow bold")
+        live.update(self.render())
+
+        rsp = self.send(f"FP:ENROLL:{slot}", timeout=10.0)
+        if "OK:ENROLL_STARTED" not in rsp:
+            self._set_msg(f"录入启动失败: {rsp}", "red bold")
+            live.update(self.render())
+            self.busy = False
+            return
+
+        last_event = -1
+        last_current = -1
+        for _ in range(400):
+            if not self.running:
+                break
+            time.sleep(0.15)
+            status_rsp = self.send("FP:STATUS")
+            parts = status_rsp.split(":")
+
+            if len(parts) < 2 or parts[0] != "OK":
+                continue
+            if parts[1] == "IDLE":
+                continue
+
+            try:
+                event = int(parts[1])
+                current = int(parts[2]) if len(parts) > 2 else 0
+                total = int(parts[3]) if len(parts) > 3 else 6
+            except ValueError:
+                continue
+
+            if event != last_event or current != last_current:
+                last_event = event
+                last_current = current
+                text = ENROLL_EVENT_TEXT.get(event, f"状态: {event}")
+
+                if event == ENROLL_COMPLETE:
+                    self._set_msg("录入完成!", "green bold")
+                    self.refresh()
+                    live.update(self.render())
+                    self.busy = False
+                    return
+                elif event == ENROLL_FAILED:
+                    self._set_msg("录入失败", "red bold")
+                    live.update(self.render())
+                    self.busy = False
+                    return
+                else:
+                    self._set_msg(f"录入 [{current}/{total}] {text}", "yellow")
+                    live.update(self.render())
+
+        if self.busy:
+            self._set_msg("录入超时", "red bold")
+            live.update(self.render())
+            self.busy = False
+
+    def do_delete(self, slot: int, live: Live) -> None:
+        self.busy = True
+        self._set_msg(f"删除槽位 {slot}...", "yellow bold")
+        live.update(self.render())
+
+        rsp = self.send(f"FP:DELETE:{slot}")
+        if "OK:DELETED" in rsp:
+            self._set_msg(f"槽位 {slot} 已删除", "green bold")
+        else:
+            self._set_msg(f"删除失败: {rsp}", "red bold")
+        self.refresh()
+        live.update(self.render())
+        self.busy = False
+
+    def do_toggle_sudo(self, live: Live) -> None:
+        self.busy = True
+        new_val = "0" if self.unlock_sudo else "1"
+        rsp = self.send(f"SET:UNLOCK_SUDO:{new_val}")
+        if rsp != "OK":
+            self._set_msg(f"\u8bbe\u7f6e\u5931\u8d25: {rsp}", "red bold")
+            live.update(self.render())
+            self.busy = False
+            return
+
+        self.unlock_sudo = new_val == "1"
+        enabling = self.unlock_sudo
+        state = "\u5df2\u542f\u7528" if enabling else "\u5df2\u7981\u7528"
+
+        # PAM 层
+        action = "add" if enabling else "remove"
+        self._set_msg(f"sudo \u6307\u7eb9\u89e3\u9501{state}\uff0c\u6b63\u5728\u66f4\u65b0 PAM...", "yellow bold")
+        live.update(self.render())
+
+        pam_rsp = self._run_pam_helper(action, "sudo")
+        if pam_rsp.startswith("OK"):
+            self.pam_sudo = enabling
+            self._set_msg(f"sudo \u6307\u7eb9\u89e3\u9501{state}", "green bold" if enabling else "yellow bold")
+        elif pam_rsp == "ERROR:MODULE_NOT_INSTALLED":
+            self._set_msg(f"sudo \u6307\u7eb9\u89e3\u9501{state} (PAM \u6a21\u5757\u672a\u5b89\u88c5)", "yellow bold")
+        elif pam_rsp in ("ERROR:PKEXEC_FAILED", "ERROR:PKEXEC_NOT_FOUND"):
+            self._set_msg(f"sudo \u6307\u7eb9\u89e3\u9501{state} (PAM \u672a\u66f4\u65b0)", "yellow bold")
+        else:
+            self._set_msg(f"sudo \u6307\u7eb9\u89e3\u9501{state} (PAM: {pam_rsp})", "yellow bold")
+        live.update(self.render())
+        self.busy = False
+
+    def do_toggle_polkit(self, live: Live) -> None:
+        self.busy = True
+        new_val = "0" if self.unlock_polkit else "1"
+        rsp = self.send(f"SET:UNLOCK_POLKIT:{new_val}")
+        if rsp != "OK":
+            self._set_msg(f"\u8bbe\u7f6e\u5931\u8d25: {rsp}", "red bold")
+            live.update(self.render())
+            self.busy = False
+            return
+
+        self.unlock_polkit = new_val == "1"
+        enabling = self.unlock_polkit
+        state = "\u5df2\u542f\u7528" if enabling else "\u5df2\u7981\u7528"
+
+        # PAM 层
+        action = "add" if enabling else "remove"
+        self._set_msg(f"polkit \u6307\u7eb9\u89e3\u9501{state}\uff0c\u6b63\u5728\u66f4\u65b0 PAM...", "yellow bold")
+        live.update(self.render())
+
+        pam_rsp = self._run_pam_helper(action, "polkit-1")
+        if pam_rsp.startswith("OK"):
+            self.pam_polkit = enabling
+            self._set_msg(f"polkit \u6307\u7eb9\u89e3\u9501{state}", "green bold" if enabling else "yellow bold")
+        elif pam_rsp == "ERROR:MODULE_NOT_INSTALLED":
+            self._set_msg(f"polkit \u6307\u7eb9\u89e3\u9501{state} (PAM \u6a21\u5757\u672a\u5b89\u88c5)", "yellow bold")
+        elif pam_rsp in ("ERROR:PKEXEC_FAILED", "ERROR:PKEXEC_NOT_FOUND"):
+            self._set_msg(f"polkit \u6307\u7eb9\u89e3\u9501{state} (PAM \u672a\u66f4\u65b0)", "yellow bold")
+        else:
+            self._set_msg(f"polkit \u6307\u7eb9\u89e3\u9501{state} (PAM: {pam_rsp})", "yellow bold")
+        live.update(self.render())
+        self.busy = False
+
+    def do_toggle_screen(self, live: Live) -> None:
+        self.busy = True
+        new_val = "0" if self.unlock_screen else "1"
+        rsp = self.send(f"SET:UNLOCK_SCREEN:{new_val}")
+        if rsp != "OK":
+            self._set_msg(f"\u8bbe\u7f6e\u5931\u8d25: {rsp}", "red bold")
+            live.update(self.render())
+            self.busy = False
+            return
+
+        self.unlock_screen = new_val == "1"
+        enabling = self.unlock_screen
+        state = "\u5df2\u542f\u7528" if enabling else "\u5df2\u7981\u7528"
+
+        # PAM 层
+        action = "add" if enabling else "remove"
+        self._set_msg(f"\u9501\u5c4f\u6307\u7eb9\u89e3\u9501{state}\uff0c\u6b63\u5728\u66f4\u65b0 PAM...", "yellow bold")
+        live.update(self.render())
+
+        pam_rsp = self._run_pam_helper(action, "gdm-password")
+        if pam_rsp.startswith("OK"):
+            self.pam_screen = enabling
+            self._set_msg(f"\u9501\u5c4f\u6307\u7eb9\u89e3\u9501{state}", "green bold" if enabling else "yellow bold")
+        elif pam_rsp == "ERROR:MODULE_NOT_INSTALLED":
+            self._set_msg(f"\u9501\u5c4f\u6307\u7eb9\u89e3\u9501{state} (PAM \u6a21\u5757\u672a\u5b89\u88c5)", "yellow bold")
+        elif pam_rsp in ("ERROR:PKEXEC_FAILED", "ERROR:PKEXEC_NOT_FOUND"):
+            self._set_msg(f"\u9501\u5c4f\u6307\u7eb9\u89e3\u9501{state} (PAM \u672a\u66f4\u65b0)", "yellow bold")
+        else:
+            self._set_msg(f"\u9501\u5c4f\u6307\u7eb9\u89e3\u9501{state} (PAM: {pam_rsp})", "yellow bold")
+        live.update(self.render())
+        self.busy = False
+
+    def do_logs(self, live: Live) -> None:
+        live.stop()
+        os.execvp("journalctl", ["journalctl", "--user", "-u", "immurok-daemon", "-f"])
+
+    # ── 工具方法 ──────────────────────────────────────────────
+
+    def _set_msg(self, text: str, style: str) -> None:
+        self.message = text
+        self.message_style = style
+
+    def _start_thread(self, fn, *args) -> None:
+        t = threading.Thread(target=fn, args=args, daemon=True)
+        t.start()
+
+    # ── 主循环 ────────────────────────────────────────────────
+
+    def run(self) -> None:
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+
+        try:
+            tty.setcbreak(fd)
+            self.refresh()
+
+            with Live(self.render(), refresh_per_second=4, screen=False) as live:
+                last_refresh = time.monotonic()
+
+                while self.running:
+                    now = time.monotonic()
+
+                    # 闪烁过期
+                    if self._flash_slot >= 0 and now >= self._flash_until:
+                        self._flash_slot = -1
+                        live.update(self.render())
+
+                    # 每 0.5 秒刷新状态 (全部读缓存，不走 BLE)
+                    if now - last_refresh >= 0.5:
+                        if not self.busy:
+                            self.refresh()
+                        live.update(self.render())
+                        last_refresh = now
+
+                    # 闪烁中需要更频繁更新
+                    if self._flash_slot >= 0:
+                        live.update(self.render())
+
+                    # 非阻塞键盘读取
+                    rlist, _, _ = select.select([sys.stdin], [], [], 0.2)
+                    if rlist:
+                        key = sys.stdin.read(1)
+                        if key:
+                            self.handle_key(key, live)
+
+        except KeyboardInterrupt:
+            pass
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def main() -> None:
+    ui = ImmurokUI()
+    ui.run()
+
+
+if __name__ == "__main__":
+    main()

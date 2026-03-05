@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""
+immurok 指纹认证弹窗 — 由 daemon 在收到 AUTH 请求时启动
+
+daemon 在认证完成后发 SIGTERM 关闭此进程。
+用户点击"取消"时进程以 exit code 1 退出。
+"""
+
+import signal
+import sys
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, GLib, Gtk
+
+
+class AuthDialog(Adw.Application):
+    def __init__(self) -> None:
+        super().__init__(application_id="com.immurok.auth-dialog")
+
+    def do_activate(self) -> None:
+        win = Adw.Window(application=self, title="immurok")
+        win.set_default_size(340, -1)
+        win.set_resizable(False)
+        win.connect("close-request", lambda _: self._on_cancel())
+
+        # 外层 box
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        # 内容区
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        content.set_margin_top(36)
+        content.set_margin_bottom(12)
+        content.set_margin_start(36)
+        content.set_margin_end(36)
+        content.set_halign(Gtk.Align.CENTER)
+
+        # 指纹图标
+        icon = Gtk.Image.new_from_icon_name("fingerprint-symbolic")
+        icon.set_pixel_size(64)
+        icon.add_css_class("dim-label")
+        content.append(icon)
+
+        # 标题
+        title = Gtk.Label(label="指纹认证")
+        title.add_css_class("title-2")
+        content.append(title)
+
+        # 提示文字
+        body = Gtk.Label(label="请按指纹传感器进行认证")
+        body.add_css_class("body")
+        body.add_css_class("dim-label")
+        content.append(body)
+
+        # 加载动画 (脉冲 spinner)
+        spinner = Gtk.Spinner(spinning=True)
+        spinner.set_size_request(24, 24)
+        spinner.set_halign(Gtk.Align.CENTER)
+        spinner.set_margin_top(8)
+        content.append(spinner)
+
+        outer.append(content)
+
+        # 分隔线 + 按钮区
+        outer.append(Gtk.Separator())
+
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        btn_box.set_margin_top(12)
+        btn_box.set_margin_bottom(12)
+        btn_box.set_margin_start(12)
+        btn_box.set_margin_end(12)
+        btn_box.set_halign(Gtk.Align.END)
+
+        cancel_btn = Gtk.Button(label="取消")
+        cancel_btn.add_css_class("pill")
+        cancel_btn.connect("clicked", lambda _: self._on_cancel())
+        btn_box.append(cancel_btn)
+
+        outer.append(btn_box)
+
+        win.set_content(outer)
+        win.present()
+
+        # 响应 SIGTERM — daemon 认证完成后关闭
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self._on_term)
+
+    def _on_cancel(self) -> bool:
+        self.quit()
+        sys.exit(1)
+
+    def _on_term(self) -> bool:
+        self.quit()
+        return GLib.SOURCE_REMOVE
+
+
+def main() -> None:
+    app = AuthDialog()
+    app.run([])
+
+
+if __name__ == "__main__":
+    main()
