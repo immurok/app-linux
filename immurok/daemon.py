@@ -8,6 +8,7 @@ immurok 守护进程 — 主 asyncio 事件循环
 import asyncio
 import logging
 import signal
+import subprocess
 import sys
 
 from .ble import ImmurokBLE
@@ -34,24 +35,29 @@ async def main() -> None:
 
     # ── 指纹匹配回调 ─────────────────────────────────────────────
 
-    def on_fp_match(page_id: int, signed: bool) -> None:
-        log.info("指纹匹配: page_id=%d, signed=%s", page_id, signed)
+    def on_fp_match(page_id: int) -> None:
+        log.info("指纹匹配: page_id=%d", page_id)
 
         # 通知指纹测试
         server.notify_fp_match(page_id)
 
         if server.has_pending_auth():
-            # 有待处理的 PAM 请求 → 直接批准
             server.approve_pending()
         elif screen.screen_locked:
-            # 屏幕锁定 → 检查锁屏解锁开关
             if not server.settings.unlock_screen:
                 log.info("屏幕锁定但锁屏解锁已关闭，跳过")
                 return
             server.set_pre_auth()
-            log.info("屏幕锁定，已设置预授权")
+            log.info("屏幕锁定，正在解锁")
+            try:
+                subprocess.Popen(
+                    ["loginctl", "unlock-session"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except FileNotFoundError:
+                log.warning("loginctl 未找到，无法解锁屏幕")
         else:
-            # 其他情况 → 设置预授权 (polkit 等)
             server.set_pre_auth()
 
     ble.on_fp_match = on_fp_match
@@ -72,14 +78,13 @@ async def main() -> None:
             return
         try:
             device_pair_status = await ble.get_pair_status()
-            if device_pair_status != 0x00:
+            if device_pair_status != 0x01:
                 log.warning("设备未配对但本地有配对数据，清除本地数据")
                 PairingData.delete()
                 ble._pairing = None
         except Exception as e:
             log.debug("检查配对状态失败: %s", e)
 
-        # 刷新指纹 bitmap 缓存
         await server.refresh_fp_bitmap()
 
     def on_connected() -> None:
@@ -111,14 +116,11 @@ async def main() -> None:
         screen_task = asyncio.create_task(screen.start())
         server_task = asyncio.create_task(server.start())
 
-        # 等待 server 启动完成
         await asyncio.sleep(0.1)
         log.info("immurok daemon 已就绪")
 
-        # 等待关闭信号
         await shutdown_event.wait()
 
-        # 优雅关闭
         log.info("正在关闭...")
         await ble.disconnect()
         await server.stop()

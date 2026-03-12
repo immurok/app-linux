@@ -1,8 +1,9 @@
 """
 immurok.security 单元测试
 
+测试 ECDH 配对、HKDF 密钥推导、HMAC 验证。
 所有测试向量由 Python hmac/hashlib 独立计算后硬编码，
-确保 HKDF/HMAC 实现与固件 immurok_security.c 一致。
+确保与固件 + docs/security.md 一致。
 """
 
 import json
@@ -11,37 +12,38 @@ from pathlib import Path
 
 import pytest
 
-from immurok.config import HKDF_INFO, HMAC_FULL_LEN, HMAC_TRUNCATED_LEN
+from immurok.config import HKDF_INFO, HKDF_SALT, HMAC_TRUNCATED_LEN
 from immurok.security import (
     PairingData,
     compute_reset_hmac,
     derive_shared_key,
-    get_host_id,
+    generate_p256_keypair,
+    ecdh_shared_secret,
     hkdf_expand,
     hkdf_extract,
-    verify_auth_response,
     verify_fp_match_signed,
 )
 
-from .conftest import DEV_RANDOM_1, DEV_RANDOM_2, HOST_RANDOM_1, HOST_RANDOM_2, TEST_HOST_ID
+from .conftest import TEST_ECDH_SECRET_1, TEST_ECDH_SECRET_2
 
 
 # ── HKDF 测试向量 ─────────────────────────────────────────────
-# 独立计算: PRK = HMAC-SHA256(host_id, ikm)
-#            OKM = HMAC-SHA256(PRK, "immurok-pairing" || 0x01)
+# Salt = "immurok-pairing-salt", Info = "immurok-shared-key"
+# PRK = HMAC-SHA256(salt, ikm)
+# OKM = HMAC-SHA256(PRK, info || 0x01)
 
 TV1_PRK = bytes.fromhex(
-    "ee5e7176b250c70e39e2ce1b1f8adc4a745ce2bee58a87dd28b62ff007bd7f58"
+    "d7dac89591ecde1a0d19653b9e48460dfb75728be0bddad5b2c9e6846d082876"
 )
 TV1_OKM = bytes.fromhex(
-    "35d7fb8cdc4e15798b843fc74aa2c0569d06af53ebbf3166b044adc4090a2b06"
+    "8ce33b7eb7b369e488d58d05d5f5638c0442eaad226c9d837edeeff17f96a2b7"
 )
 
 TV2_PRK = bytes.fromhex(
-    "c0b18e36e474367b5ce5fd0ab04d9a623b407159b05864fe3b05049d5335f4c3"
+    "faa2b9a1960da45cc55e4edc5bd8320fdbca0d5bfb52b9afa0a625a216ce26f8"
 )
 TV2_OKM = bytes.fromhex(
-    "4566a08acb88b35bb73373d0595b1b20d832ee07d381da4978a79e71abe5b870"
+    "839da97831d5093fdc0c13f45867f2962a27e38c1b4b9be661e5846f4902349c"
 )
 
 
@@ -50,12 +52,10 @@ TV2_OKM = bytes.fromhex(
 
 class TestHKDF:
     def test_extract_tv1(self):
-        ikm = HOST_RANDOM_1 + DEV_RANDOM_1
-        assert hkdf_extract(TEST_HOST_ID, ikm) == TV1_PRK
+        assert hkdf_extract(HKDF_SALT, TEST_ECDH_SECRET_1) == TV1_PRK
 
     def test_extract_tv2(self):
-        ikm = HOST_RANDOM_2 + DEV_RANDOM_2
-        assert hkdf_extract(TEST_HOST_ID, ikm) == TV2_PRK
+        assert hkdf_extract(HKDF_SALT, TEST_ECDH_SECRET_2) == TV2_PRK
 
     def test_expand_tv1(self):
         assert hkdf_expand(TV1_PRK, HKDF_INFO, 32) == TV1_OKM
@@ -64,16 +64,15 @@ class TestHKDF:
         assert hkdf_expand(TV2_PRK, HKDF_INFO, 32) == TV2_OKM
 
     def test_derive_shared_key_tv1(self):
-        assert derive_shared_key(HOST_RANDOM_1, DEV_RANDOM_1, TEST_HOST_ID) == TV1_OKM
+        assert derive_shared_key(TEST_ECDH_SECRET_1) == TV1_OKM
 
     def test_derive_shared_key_tv2(self):
-        assert derive_shared_key(HOST_RANDOM_2, DEV_RANDOM_2, TEST_HOST_ID) == TV2_OKM
+        assert derive_shared_key(TEST_ECDH_SECRET_2) == TV2_OKM
 
     def test_derive_key_length(self, shared_key_1):
         assert len(shared_key_1) == 32
 
     def test_extract_empty_salt_uses_zeros(self):
-        """空 salt 应使用 32 字节零值 (匹配固件 default_salt)"""
         import hashlib
         import hmac
 
@@ -87,110 +86,87 @@ class TestHKDF:
             hkdf_expand(b"\x00" * 32, b"info", 33)
 
     def test_derive_key_deterministic(self):
-        """相同输入 → 相同输出"""
-        k1 = derive_shared_key(HOST_RANDOM_1, DEV_RANDOM_1, TEST_HOST_ID)
-        k2 = derive_shared_key(HOST_RANDOM_1, DEV_RANDOM_1, TEST_HOST_ID)
+        k1 = derive_shared_key(TEST_ECDH_SECRET_1)
+        k2 = derive_shared_key(TEST_ECDH_SECRET_1)
         assert k1 == k2
 
     def test_derive_key_different_input(self):
-        """不同输入 → 不同输出"""
-        k1 = derive_shared_key(HOST_RANDOM_1, DEV_RANDOM_1, TEST_HOST_ID)
-        k2 = derive_shared_key(HOST_RANDOM_2, DEV_RANDOM_2, TEST_HOST_ID)
+        k1 = derive_shared_key(TEST_ECDH_SECRET_1)
+        k2 = derive_shared_key(TEST_ECDH_SECRET_2)
         assert k1 != k2
 
 
-# ── 签名 FP 匹配 HMAC ─────────────────────────────────────────
-# CH592F HMAC 输入: page_id(2 LE) || timestamp(4 LE) (无 counter)
+# ── ECDH P-256 ─────────────────────────────────────────────────
 
-TV_FP_HMAC = bytes.fromhex("1c6deffa14400633")  # key=TV1_OKM, pid=3, ts=0x12345678
+
+class TestECDH:
+    def test_generate_keypair(self):
+        privkey, pubkey = generate_p256_keypair()
+        assert len(pubkey) == 33  # compressed P-256 公钥
+        assert pubkey[0] in (0x02, 0x03)  # 压缩前缀
+
+    def test_ecdh_roundtrip(self):
+        """两端各自生成密钥对，交换公钥后计算共享密钥应一致"""
+        priv_a, pub_a = generate_p256_keypair()
+        priv_b, pub_b = generate_p256_keypair()
+
+        secret_a = ecdh_shared_secret(priv_a, pub_b)
+        secret_b = ecdh_shared_secret(priv_b, pub_a)
+        assert secret_a == secret_b
+        assert len(secret_a) == 32
+
+    def test_derive_from_ecdh(self):
+        """ECDH + HKDF 推导共享密钥"""
+        priv_a, pub_a = generate_p256_keypair()
+        priv_b, pub_b = generate_p256_keypair()
+
+        secret = ecdh_shared_secret(priv_a, pub_b)
+        key = derive_shared_key(secret)
+        assert len(key) == 32
+
+
+# ── 签名 FP 匹配 HMAC ─────────────────────────────────────────
+# docs/security.md:
+#   message = 0x21 || page_id(2 LE)    (3 bytes)
+#   hmac = HMAC-SHA256(shared_key, message)[0:8]
+
+TV_FP_HMAC = bytes.fromhex("f40d525ac61aff04")  # key=TV1_OKM, pid=3
 
 
 class TestFPMatchSigned:
     def test_verify_known_vector(self, shared_key_1):
         assert verify_fp_match_signed(
-            shared_key_1, page_id=3, timestamp=0x12345678,
+            shared_key_1, page_id=3,
             received_hmac=TV_FP_HMAC,
         )
 
     def test_wrong_page_id_fails(self, shared_key_1):
         assert not verify_fp_match_signed(
-            shared_key_1, page_id=4, timestamp=0x12345678,
-            received_hmac=TV_FP_HMAC,
-        )
-
-    def test_wrong_timestamp_fails(self, shared_key_1):
-        assert not verify_fp_match_signed(
-            shared_key_1, page_id=3, timestamp=0x12345679,
+            shared_key_1, page_id=4,
             received_hmac=TV_FP_HMAC,
         )
 
     def test_wrong_key_fails(self, shared_key_2):
         assert not verify_fp_match_signed(
-            shared_key_2, page_id=3, timestamp=0x12345678,
+            shared_key_2, page_id=3,
             received_hmac=TV_FP_HMAC,
         )
 
     def test_hmac_input_layout(self, shared_key_1):
-        """验证 HMAC 输入的字节布局: page_id(2 LE) || ts(4 LE) = 6 字节 (CH592F 无 counter)"""
+        """验证 HMAC 输入: 0x21 || page_id(2 LE) = 3 字节"""
         import hashlib
         import hmac
 
-        data = struct.pack("<HI", 3, 0x12345678)
-        assert len(data) == 6
+        data = bytes([0x21]) + struct.pack("<H", 3)
+        assert len(data) == 3
         expected = hmac.new(shared_key_1, data, hashlib.sha256).digest()[:8]
         assert expected == TV_FP_HMAC
-
-
-# ── AUTH_RESPONSE HMAC ─────────────────────────────────────────
-# CH592F HMAC 输入: challenge(8) || nonce(8) || "auth-ok"(7) = 23 字节 (无 counter)
-
-TV_AUTH_CHALLENGE = bytes.fromhex("0102030405060708")
-TV_AUTH_NONCE = bytes.fromhex("a0b0c0d0e0f00010")
-TV_AUTH_HMAC = bytes.fromhex("a9bb0c14a67cb815")  # key=TV1_OKM
-
-
-class TestAuthResponse:
-    def test_verify_known_vector(self, shared_key_1):
-        assert verify_auth_response(
-            shared_key_1, TV_AUTH_CHALLENGE, TV_AUTH_NONCE,
-            TV_AUTH_HMAC,
-        )
-
-    def test_wrong_challenge_fails(self, shared_key_1):
-        bad_challenge = b"\xff" * 8
-        assert not verify_auth_response(
-            shared_key_1, bad_challenge, TV_AUTH_NONCE,
-            TV_AUTH_HMAC,
-        )
-
-    def test_wrong_nonce_fails(self, shared_key_1):
-        bad_nonce = b"\xff" * 8
-        assert not verify_auth_response(
-            shared_key_1, TV_AUTH_CHALLENGE, bad_nonce,
-            TV_AUTH_HMAC,
-        )
-
-    def test_wrong_key_fails(self, shared_key_2):
-        assert not verify_auth_response(
-            shared_key_2, TV_AUTH_CHALLENGE, TV_AUTH_NONCE,
-            TV_AUTH_HMAC,
-        )
-
-    def test_hmac_input_layout(self, shared_key_1):
-        """验证 23 字节 HMAC 输入布局 (CH592F 无 counter)"""
-        import hashlib
-        import hmac
-
-        data = TV_AUTH_CHALLENGE + TV_AUTH_NONCE + b"auth-ok"
-        assert len(data) == 23
-        expected = hmac.new(shared_key_1, data, hashlib.sha256).digest()[:8]
-        assert expected == TV_AUTH_HMAC
 
 
 # ── 出厂重置 HMAC ─────────────────────────────────────────────
 
 TV_RESET_HMAC = bytes.fromhex(
-    "9b9c1ee5d985b1556b74c3cf4ce48813a3f39a7ba66f6cb75c3a14452206cc5c"
+    "76d4ceed270272a5509ccc55b9a6585651f5405841fb5487f03da028ba2c44c8"
 )
 
 
@@ -200,27 +176,10 @@ class TestResetHMAC:
 
     def test_full_32_bytes(self, shared_key_1):
         result = compute_reset_hmac(shared_key_1)
-        assert len(result) == HMAC_FULL_LEN
+        assert len(result) == 32
 
     def test_different_key(self, shared_key_2):
         assert compute_reset_hmac(shared_key_2) != TV_RESET_HMAC
-
-
-# ── Host ID ────────────────────────────────────────────────────
-
-
-class TestHostID:
-    def test_length(self):
-        hid = get_host_id()
-        assert len(hid) == 16
-
-    def test_deterministic(self):
-        assert get_host_id() == get_host_id()
-
-    def test_from_machine_id(self):
-        mid = Path("/etc/machine-id").read_text().strip()
-        expected = bytes.fromhex(mid)[:16]
-        assert get_host_id() == expected
 
 
 # ── PairingData 持久化 ─────────────────────────────────────────
@@ -229,7 +188,6 @@ class TestHostID:
 class TestPairingData:
     @pytest.fixture(autouse=True)
     def clean_pairing(self, tmp_path, monkeypatch):
-        """将配对文件路径重定向到临时目录"""
         pairing_file = tmp_path / "pairing.json"
         monkeypatch.setattr(
             PairingData, "_pairing_path", staticmethod(lambda: pairing_file)
@@ -239,27 +197,18 @@ class TestPairingData:
             pairing_file.unlink()
 
     def test_save_and_load(self, shared_key_1):
-        p = PairingData(
-            device_id=b"\xAA" * 16,
-            shared_key=shared_key_1,
-            host_id=get_host_id(),
-            auth_counter=10,
-            notify_counter=5,
-        )
+        p = PairingData(shared_key=shared_key_1)
         p.save()
 
         loaded = PairingData.load()
         assert loaded is not None
-        assert loaded.device_id == b"\xAA" * 16
         assert loaded.shared_key == shared_key_1
-        assert loaded.auth_counter == 10
-        assert loaded.notify_counter == 5
 
     def test_load_nonexistent(self):
         assert PairingData.load() is None
 
     def test_delete(self, shared_key_1):
-        p = PairingData(b"\xBB" * 16, shared_key_1, get_host_id())
+        p = PairingData(shared_key=shared_key_1)
         p.save()
         assert PairingData.load() is not None
         assert PairingData.delete() is True
@@ -268,46 +217,14 @@ class TestPairingData:
     def test_delete_nonexistent(self):
         assert PairingData.delete() is False
 
-    def test_increment_auth_counter(self, shared_key_1):
-        p = PairingData(b"\xCC" * 16, shared_key_1, get_host_id(), auth_counter=0)
-        p.save()
-
-        assert p.increment_auth_counter() == 1
-        assert p.increment_auth_counter() == 2
-        assert p.increment_auth_counter() == 3
-
-        # 重新加载，确认持久化
-        loaded = PairingData.load()
-        assert loaded.auth_counter == 3
-
-    def test_update_notify_counter(self, shared_key_1):
-        p = PairingData(b"\xDD" * 16, shared_key_1, get_host_id(), notify_counter=0)
-        p.save()
-
-        p.update_notify_counter(5)
-        assert p.notify_counter == 5
-
-        # 不能倒退
-        p.update_notify_counter(3)
-        assert p.notify_counter == 5
-
-        # 重新加载确认
-        loaded = PairingData.load()
-        assert loaded.notify_counter == 5
-
     def test_json_format(self, shared_key_1):
-        p = PairingData(b"\xEE" * 16, shared_key_1, get_host_id())
+        p = PairingData(shared_key=shared_key_1)
         p.save()
 
         path = PairingData._pairing_path()
         data = json.loads(path.read_text())
-        assert "device_id" in data
         assert "shared_key" in data
-        assert "host_id" in data
-        assert "auth_counter" in data
-        assert "notify_counter" in data
-        # 值是 hex 字符串
-        assert data["device_id"] == "ee" * 16
+        assert data["shared_key"] == shared_key_1.hex()
 
     def test_load_corrupted_returns_none(self):
         path = PairingData._pairing_path()
@@ -318,5 +235,5 @@ class TestPairingData:
     def test_load_missing_field_returns_none(self):
         path = PairingData._pairing_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text('{"device_id": "aa"}')  # 缺少 shared_key 等
+        path.write_text('{"device_id": "aa"}')  # 缺少 shared_key
         assert PairingData.load() is None

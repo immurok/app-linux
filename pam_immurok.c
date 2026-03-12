@@ -1,7 +1,8 @@
 /*
  * pam_immurok.c - PAM module for immurok fingerprint authentication (Linux)
  *
- * Communicates with immurok-daemon via Unix socket.
+ * Communicates with immurok-daemon via Unix socket at ~/.immurok/pam.sock.
+ * The socket path is resolved from the authenticating user's home directory.
  * Protocol: "AUTH:username:service" -> "OK", "DENY", or "TIMEOUT"
  */
 
@@ -9,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pwd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <errno.h>
@@ -22,7 +24,7 @@
 #include <security/pam_modules.h>
 #include <security/pam_ext.h>
 
-#define SOCKET_PATH "/tmp/immurok.sock"
+#define SOCKET_NAME ".immurok/pam.sock"
 #define DEFAULT_TIMEOUT_SEC 40
 #define BUFFER_SIZE 256
 
@@ -44,8 +46,18 @@ static int authenticate_via_socket(pam_handle_t *pamh, const char *user,
     struct sockaddr_un addr;
     char request[BUFFER_SIZE];
     char response[BUFFER_SIZE];
+    char socket_path[256];
     ssize_t n;
     struct timeval tv;
+    struct passwd *pw;
+
+    /* Resolve the authenticating user's home directory */
+    pw = getpwnam(user);
+    if (pw == NULL || pw->pw_dir == NULL) {
+        pam_syslog(pamh, LOG_ERR, "Cannot resolve home for user: %s", user);
+        return PAM_AUTH_ERR;
+    }
+    snprintf(socket_path, sizeof(socket_path), "%s/%s", pw->pw_dir, SOCKET_NAME);
 
     sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock < 0)
@@ -58,10 +70,11 @@ static int authenticate_via_socket(pam_handle_t *pamh, const char *user,
 
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
 
     if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        pam_syslog(pamh, LOG_ERR, "Failed to connect: %s", strerror(errno));
+        pam_syslog(pamh, LOG_ERR, "Failed to connect to %s: %s",
+                   socket_path, strerror(errno));
         close(sock);
         return PAM_AUTH_ERR;
     }

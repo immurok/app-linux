@@ -49,11 +49,14 @@ class SocketServer:
         self._enroll_current = 0
         self._enroll_total = 0
 
-        # 指纹 bitmap 缓存 (避免每次轮询走 BLE)
+        # 指纹 bitmap 缓存
         self._fp_bitmap: int = 0
 
-        # 最近一次指纹匹配 (供 CLI 查询)
+        # 最近一次指纹匹配
         self._last_match_page_id: int = -1
+
+        # 电池电量 (0-100%, None = 未知)
+        self._battery_level: int | None = None
 
     @property
     def settings(self) -> Settings:
@@ -63,8 +66,6 @@ class SocketServer:
 
     @staticmethod
     def _show_auth_dialog() -> subprocess.Popen | None:
-        """启动指纹认证弹窗，返回进程句柄。"""
-        # 查找 immurok-auth-dialog 脚本
         pkg_dir = os.path.dirname(os.path.abspath(__file__))
         dialog = os.path.join(os.path.dirname(pkg_dir), "immurok-auth-dialog")
         if not os.path.isfile(dialog):
@@ -82,7 +83,6 @@ class SocketServer:
 
     @staticmethod
     def _close_auth_dialog(proc: subprocess.Popen | None) -> None:
-        """关闭认证弹窗。"""
         if proc is None or proc.poll() is not None:
             return
         proc.terminate()
@@ -134,45 +134,55 @@ class SocketServer:
     def end_enrollment(self) -> None:
         self._enroll_active = False
 
-    # ── 指纹 bitmap 缓存 ─────────────────────────────────────────────
+    # ── 指纹 bitmap 缓存 ─────────────────────────────────────────
 
-    async def refresh_fp_bitmap(self) -> None:
-        """从 BLE 设备刷新指纹 bitmap 缓存。"""
+    async def refresh_device_status(self) -> None:
+        """刷新设备状态（指纹位图 + 配对状态 + 电池电量）"""
         if not self._ble.connected:
             return
         try:
-            self._fp_bitmap = await self._ble.fp_list()
-            log.debug("FP bitmap 已刷新: 0x%02x", self._fp_bitmap)
+            bitmap, _, battery = await self._ble.get_status()
+            self._fp_bitmap = bitmap
+            self._battery_level = battery
+            log.debug("设备状态已刷新: bitmap=0x%02x, battery=%s",
+                      bitmap, f"{battery}%" if battery is not None else "n/a")
         except Exception as e:
-            log.warning("刷新 FP bitmap 失败: %s", e)
+            log.warning("刷新设备状态失败: %s", e)
 
-    # ── 指纹测试 ───────────────────────────────────────────────────
+    async def refresh_fp_bitmap(self) -> None:
+        """刷新指纹位图（向后兼容，内部调用 refresh_device_status）"""
+        await self.refresh_device_status()
+
+    # ── 指纹匹配通知 ─────────────────────────────────────────────
 
     def notify_fp_match(self, page_id: int) -> None:
-        """记录最近一次指纹匹配，供 CLI 轮询消费。"""
         self._last_match_page_id = page_id
 
     # ── 服务器生命周期 ───────────────────────────────────────────
 
     async def start(self) -> None:
+        sock_path = os.path.expanduser(SOCKET_PATH)
+        os.makedirs(os.path.dirname(sock_path), exist_ok=True)
         try:
-            os.unlink(SOCKET_PATH)
+            os.unlink(sock_path)
         except FileNotFoundError:
             pass
 
         self._server = await asyncio.start_unix_server(
-            self._handle_client, path=SOCKET_PATH
+            self._handle_client, path=sock_path
         )
-        os.chmod(SOCKET_PATH, 0o666)
-        log.info("Socket 服务器已启动: %s", SOCKET_PATH)
+        os.chmod(sock_path, 0o600)
+        self._sock_path = sock_path
+        log.info("Socket 服务器已启动: %s", sock_path)
 
     async def stop(self) -> None:
         if self._server:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        sock_path = getattr(self, "_sock_path", os.path.expanduser(SOCKET_PATH))
         try:
-            os.unlink(SOCKET_PATH)
+            os.unlink(sock_path)
         except FileNotFoundError:
             pass
         log.info("Socket 服务器已停止")
@@ -223,12 +233,12 @@ class SocketServer:
     def _handle_status(self) -> str:
         connected = self._ble.connected
         device_name = "immurok" if connected else ""
-        return f"STATUS:{'1' if connected else '0'}:{device_name}"
+        batt = self._battery_level if self._battery_level is not None else -1
+        return f"STATUS:{'1' if connected else '0'}:{device_name}:{batt}"
 
     # ── AUTH ──────────────────────────────────────────────────────
 
     def _is_service_allowed(self, service: str) -> bool:
-        """根据 service 名称检查对应功能开关。"""
         s = service.lower()
         if "gdm" in s or "login" in s:
             return self._settings.unlock_screen
@@ -236,20 +246,17 @@ class SocketServer:
             return self._settings.unlock_polkit
         if s == "sudo":
             return self._settings.unlock_sudo
-        # 其他权限提升类，跟随 sudo 开关
         return self._settings.unlock_sudo
 
     async def _watch_client(self, reader: asyncio.StreamReader) -> None:
-        """等待客户端断开连接 (PAM 模块超时关闭 socket)。"""
         try:
             await reader.read(1)
         except Exception:
             pass
 
     async def _watch_dialog(self, proc: subprocess.Popen | None) -> None:
-        """等待弹窗进程退出 (用户点击取消)。"""
         if proc is None:
-            await asyncio.Event().wait()  # 永不触发
+            await asyncio.Event().wait()
             return
         while proc.poll() is None:
             await asyncio.sleep(0.2)
@@ -261,22 +268,18 @@ class SocketServer:
         service = parts[2] if len(parts) >= 3 else "unknown"
         log.info("AUTH 请求: user=%s, service=%s", user, service)
 
-        # 0. 检查功能开关
         if not self._is_service_allowed(service):
             log.info("AUTH 拒绝 (开关已关闭): service=%s", service)
             return "DENY"
 
-        # 1. 检查预授权
         if self.consume_pre_auth():
             log.info("AUTH 通过预授权批准: %s", user)
             return "OK"
 
-        # 2. 检查 BLE 连接
         if not self._ble.connected:
             log.warning("AUTH 失败: 设备未连接")
             return "DENY"
 
-        # 3. 设置待处理请求，发送 AUTH_REQUEST 等待指纹
         self._pending_auth = asyncio.Event()
         self._pending_approved = False
         dialog_proc = self._show_auth_dialog()
@@ -295,22 +298,18 @@ class SocketServer:
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
-            # 指纹主动批准 (on_fp_match 路径)
             if self._pending_approved:
                 log.info("AUTH 通过主动指纹批准: %s", user)
                 return "OK"
 
-            # 客户端断开 (PAM 模块超时)
             if client_task in done:
                 log.info("AUTH 客户端已断开: %s", user)
                 return "DENY"
 
-            # 用户取消弹窗
             if dialog_task in done:
                 log.info("AUTH 用户取消: %s", user)
                 return "DENY"
 
-            # BLE auth_request 完成
             if auth_task in done:
                 try:
                     success = auth_task.result()
@@ -322,7 +321,6 @@ class SocketServer:
                     log.info("AUTH 通过设备认证: %s", user)
                     return "OK"
 
-                # auth_request 失败，继续等待其他路径
                 log.info("AUTH_REQUEST 失败，继续等待指纹匹配...")
                 remaining = [pending_task, client_task, dialog_task]
                 done2, _ = await asyncio.wait(
@@ -363,12 +361,18 @@ class SocketServer:
             return self._handle_fp_status()
         elif sub == "LAST_MATCH":
             return self._handle_fp_last_match()
+        elif sub == "VERIFY":
+            return await self._handle_fp_verify()
         else:
             return "ERROR:UNKNOWN_COMMAND"
 
     async def _handle_fp_list(self) -> str:
         if not self._ble.connected:
             return "ERROR:NOT_CONNECTED"
+        try:
+            self._fp_bitmap = await self._ble.fp_list()
+        except Exception:
+            pass
         return f"OK:{self._fp_bitmap}"
 
     async def _handle_fp_enroll(self, parts: list[str]) -> str:
@@ -386,18 +390,17 @@ class SocketServer:
 
         self.start_enrollment()
         try:
-            status = await self._ble.enroll_start(slot)
-            if status == STATUS_OK:
+            success, error = await self._ble.enroll_start(slot)
+            if success:
                 return "OK:ENROLL_STARTED"
             self.end_enrollment()
-            return f"ERROR:ENROLL_FAILED:0x{status:02x}"
+            return f"ERROR:ENROLL_FAILED:0x{error:02x}" if error else "ERROR:ENROLL_FAILED"
         except Exception as e:
             self.end_enrollment()
             log.warning("FP:ENROLL 失败: %s", e)
             return "ERROR:ENROLL_FAILED"
 
     def _schedule_fp_bitmap_refresh(self) -> None:
-        """安排异步刷新 fp_bitmap 缓存。"""
         try:
             asyncio.get_running_loop().create_task(self.refresh_fp_bitmap())
         except RuntimeError:
@@ -415,11 +418,11 @@ class SocketServer:
             return "ERROR:NOT_CONNECTED"
 
         try:
-            status = await self._ble.delete_fp(slot)
-            if status == STATUS_OK:
+            success, error = await self._ble.delete_fp(slot)
+            if success:
                 await self.refresh_fp_bitmap()
                 return "OK:DELETED"
-            return f"ERROR:DELETE_FAILED:0x{status:02x}"
+            return f"ERROR:DELETE_FAILED:0x{error:02x}" if error else "ERROR:DELETE_FAILED"
         except Exception as e:
             log.warning("FP:DELETE 失败: %s", e)
             return "ERROR:DELETE_FAILED"
@@ -430,10 +433,22 @@ class SocketServer:
         return f"OK:{self._enroll_event}:{self._enroll_current}:{self._enroll_total}"
 
     def _handle_fp_last_match(self) -> str:
-        """返回并消费最近一次指纹匹配的 page_id，无匹配返回 -1。"""
         page_id = self._last_match_page_id
         self._last_match_page_id = -1
         return f"OK:{page_id}"
+
+    async def _handle_fp_verify(self) -> str:
+        """发送 AUTH_REQUEST 验证指纹（用于测试）"""
+        if not self._ble.connected:
+            return "ERROR:NOT_CONNECTED"
+        if not self._ble.paired:
+            return "ERROR:NOT_PAIRED"
+        try:
+            success = await self._ble.auth_request()
+            return "OK:MATCH" if success else "OK:NO_MATCH"
+        except Exception as e:
+            log.warning("FP:VERIFY 失败: %s", e)
+            return f"ERROR:VERIFY_FAILED:{e}"
 
     # ── PAIR ──────────────────────────────────────────────────────
 
@@ -457,7 +472,7 @@ class SocketServer:
 
         pairing = PairingData.load()
         if pairing is not None:
-            return f"OK:PAIRED:{pairing.device_id.hex()}"
+            return "OK:PAIRED"
         return "OK:UNPAIRED"
 
     async def _handle_pair_start(self) -> str:
@@ -475,8 +490,7 @@ class SocketServer:
 
         if self._ble.paired and self._ble.connected:
             try:
-                hmac_val = compute_reset_hmac(self._ble.pairing.shared_key)
-                await self._ble.factory_reset(hmac_val)
+                await self._ble.factory_reset()
             except Exception as e:
                 log.warning("工厂重置命令失败: %s", e)
 

@@ -1,8 +1,10 @@
 """
-immurok 安全模块 — HKDF / HMAC / 配对数据持久化
+immurok 安全模块 — ECDH 配对 / HKDF / HMAC / 配对数据持久化
 
-所有密码学参数严格匹配固件 immurok_security.c，包含反重放 counter。
-仅使用 Python 标准库 (hashlib, hmac)。
+所有密码学参数严格匹配固件 + docs/security.md:
+  - ECDH P-256 配对 (ephemeral keypair)
+  - HKDF-SHA256 (Salt="immurok-pairing-salt", Info="immurok-shared-key")
+  - HMAC-SHA256 (截断 8 字节) 用于 FP 通知验证
 """
 
 import hashlib
@@ -12,25 +14,51 @@ import os
 import struct
 from pathlib import Path
 
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    PublicFormat,
+)
+
 from .config import (
-    CHALLENGE_LEN,
+    COMPRESSED_PUBKEY_LEN,
     HKDF_INFO,
-    HMAC_FULL_LEN,
+    HKDF_SALT,
     HMAC_TRUNCATED_LEN,
-    NONCE_LEN,
     PAIRING_DIR,
     PAIRING_FILE,
-    RANDOM_LEN,
     SHARED_KEY_LEN,
 )
 
 
-# ── Host ID ────────────────────────────────────────────────────
+# ── ECDH P-256 ────────────────────────────────────────────────
 
-def get_host_id() -> bytes:
-    """从 /etc/machine-id 读取并截取前 16 字节作为 host_id。"""
-    mid = Path("/etc/machine-id").read_text().strip()
-    return bytes.fromhex(mid)[:16]
+def generate_p256_keypair() -> tuple[ec.EllipticCurvePrivateKey, bytes]:
+    """
+    生成 P-256 临时密钥对。
+    返回 (private_key, compressed_pubkey_33B)。
+    """
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    compressed = private_key.public_key().public_bytes(
+        Encoding.X962, PublicFormat.CompressedPoint
+    )
+    return private_key, compressed
+
+
+def ecdh_shared_secret(
+    private_key: ec.EllipticCurvePrivateKey,
+    peer_compressed_pubkey: bytes,
+) -> bytes:
+    """
+    计算 ECDH 共享密钥 (32 字节 big-endian)。
+    peer_compressed_pubkey 是 33 字节的压缩公钥。
+    """
+    peer_pubkey = ec.EllipticCurvePublicKey.from_encoded_point(
+        ec.SECP256R1(), peer_compressed_pubkey
+    )
+    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+    shared = private_key.exchange(ec.ECDH(), peer_pubkey)
+    return shared  # 32 bytes
 
 
 # ── HKDF-SHA256 (单 block, 匹配固件) ─────────────────────────
@@ -50,18 +78,16 @@ def hkdf_expand(prk: bytes, info: bytes, length: int = 32) -> bytes:
     return _hmac.new(prk, data, hashlib.sha256).digest()[:length]
 
 
-def derive_shared_key(host_random: bytes, device_random: bytes,
-                      host_id: bytes) -> bytes:
+def derive_shared_key(ecdh_secret: bytes) -> bytes:
     """
-    从配对随机数推导共享密钥 (32 字节)。
+    从 ECDH 共享密钥推导 shared_key (32 字节)。
 
-    固件 immurok_security.c (CH592F):
-      IKM  = host_random(16) || device_random(16)
-      Salt = host_id (16 bytes)
-      Info = "immurok-pairing" (15 bytes)
+    docs/security.md:
+      IKM  = ECDH shared secret (32 bytes, big-endian)
+      Salt = "immurok-pairing-salt" (20 bytes)
+      Info = "immurok-shared-key" (18 bytes)
     """
-    ikm = host_random[:RANDOM_LEN] + device_random[:RANDOM_LEN]
-    prk = hkdf_extract(host_id, ikm)
+    prk = hkdf_extract(HKDF_SALT, ecdh_secret)
     return hkdf_expand(prk, HKDF_INFO, SHARED_KEY_LEN)
 
 
@@ -84,40 +110,16 @@ def _constant_time_eq(a: bytes, b: bytes) -> bool:
 def verify_fp_match_signed(
     key: bytes,
     page_id: int,
-    timestamp: int,
     received_hmac: bytes,
 ) -> bool:
     """
     验证固件发来的签名指纹匹配通知。
 
-    HMAC 输入 (6 字节): page_id(2 LE) || timestamp(4 LE)
-    固件 CH592F: immurok_security.c:667-682 (无 counter)
+    docs/security.md:
+      message = 0x21 || page_id(2 LE)    (3 bytes)
+      hmac = HMAC-SHA256(shared_key, message)[0:8]
     """
-    hmac_input = struct.pack("<HI", page_id, timestamp)
-    expected = _hmac_truncated(key, hmac_input)
-    return _constant_time_eq(expected, received_hmac)
-
-
-# ── AUTH_RESPONSE 验证 ─────────────────────────────────────────
-
-def verify_auth_response(
-    key: bytes,
-    challenge: bytes,
-    device_nonce: bytes,
-    received_hmac: bytes,
-) -> bool:
-    """
-    验证固件返回的认证响应 HMAC。
-
-    HMAC 输入 (23 字节):
-      challenge(8) || device_nonce(8) || "auth-ok"(7)
-    固件 CH592F: immurok_security.c:367-378
-    """
-    hmac_input = (
-        challenge[:CHALLENGE_LEN]
-        + device_nonce[:NONCE_LEN]
-        + b"auth-ok"
-    )
+    hmac_input = bytes([0x21]) + struct.pack("<H", page_id)
     expected = _hmac_truncated(key, hmac_input)
     return _constant_time_eq(expected, received_hmac)
 
@@ -128,54 +130,17 @@ def compute_reset_hmac(key: bytes) -> bytes:
     """
     计算出厂重置的完整 32 字节 HMAC。
     HMAC 输入: "factory-reset" (13 字节)
-    固件: immurok_security.c:494-502
     """
     return _hmac_sha256(key, b"factory-reset")
-
-
-# ── 命令认证 HMAC ─────────────────────────────────────────────
-
-def compute_cmd_hmac(key: bytes, cmd: int, payload: bytes, challenge: bytes) -> bytes:
-    """
-    计算命令认证的截断 HMAC (8 字节)。
-
-    HMAC 输入: cmd(1) || payload || challenge(8)
-    固件: immurok_security.c:603-617 (verify_cmd)
-    """
-    hmac_input = bytes([cmd]) + payload + challenge[:CHALLENGE_LEN]
-    return _hmac_truncated(key, hmac_input)
 
 
 # ── 配对数据持久化 ─────────────────────────────────────────────
 
 class PairingData:
-    """配对数据管理：密钥、设备 ID、counter 持久化到 ~/.immurok/pairing.json"""
+    """配对数据管理：ECDH 共享密钥持久化到 ~/.immurok/pairing.json"""
 
-    def __init__(
-        self,
-        device_id: bytes,
-        shared_key: bytes,
-        host_id: bytes,
-        auth_counter: int = 0,
-        notify_counter: int = 0,
-    ):
-        self.device_id = device_id
+    def __init__(self, shared_key: bytes):
         self.shared_key = shared_key
-        self.host_id = host_id
-        self.auth_counter = auth_counter
-        self.notify_counter = notify_counter
-
-    def increment_auth_counter(self) -> int:
-        """递增并持久化 auth_counter，返回新值。"""
-        self.auth_counter += 1
-        self.save()
-        return self.auth_counter
-
-    def update_notify_counter(self, counter: int) -> None:
-        """更新 notify_counter (从设备通知中获取)，持久化。"""
-        if counter > self.notify_counter:
-            self.notify_counter = counter
-            self.save()
 
     @staticmethod
     def _pairing_path() -> Path:
@@ -184,13 +149,7 @@ class PairingData:
     def save(self) -> None:
         path = self._pairing_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "device_id": self.device_id.hex(),
-            "shared_key": self.shared_key.hex(),
-            "host_id": self.host_id.hex(),
-            "auth_counter": self.auth_counter,
-            "notify_counter": self.notify_counter,
-        }
+        data = {"shared_key": self.shared_key.hex()}
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2))
         tmp.replace(path)
@@ -202,13 +161,7 @@ class PairingData:
             return None
         try:
             data = json.loads(path.read_text())
-            return cls(
-                device_id=bytes.fromhex(data["device_id"]),
-                shared_key=bytes.fromhex(data["shared_key"]),
-                host_id=bytes.fromhex(data["host_id"]),
-                auth_counter=data.get("auth_counter", 0),
-                notify_counter=data.get("notify_counter", 0),
-            )
+            return cls(shared_key=bytes.fromhex(data["shared_key"]))
         except (json.JSONDecodeError, KeyError, ValueError):
             return None
 

@@ -4,13 +4,11 @@ immurok BLE 通信模块 — dbus-fast 直接访问 BlueZ GATT
 设备作为 HID 键盘已由 BlueZ 管理连接，daemon 通过 D-Bus 直接访问
 已连接设备的自定义 GATT 服务，无需 BleakClient.connect()。
 
-协议严格匹配固件 ble_hid_kbd.c / immurok_security.c。
-命令响应通过 write CMD + read RSP 获取；异步事件通过 RSP 通知到达。
+协议严格匹配 docs/protocol.md + docs/security.md。
 """
 
 import asyncio
 import logging
-import os
 import struct
 from typing import Callable, Optional
 
@@ -21,11 +19,9 @@ from .config import (
     BLE_AUTH_TIMEOUT,
     BLE_COMMAND_TIMEOUT,
     BLE_DEVICE_NAME_PREFIX,
-    BLE_PAIR_MAX_RETRIES,
-    BLE_PAIR_POLL_INTERVAL,
+    BLE_FP_GATE_TIMEOUT,
+    BLE_PAIR_TIMEOUT,
     BLE_RECONNECT_INTERVAL,
-    BLE_SCAN_TIMEOUT,
-    CHALLENGE_LEN,
     CHAR_CMD_UUID,
     CHAR_RSP_UUID,
     CMD_AUTH_REQUEST,
@@ -34,32 +30,29 @@ from .config import (
     CMD_ENROLL_STATUS,
     CMD_FACTORY_RESET,
     CMD_FP_LIST,
-    CMD_FP_MATCHED,
     CMD_FP_MATCH_ACK,
     CMD_FP_MATCH_SIGNED,
-    CMD_GET_CMD_CHALLENGE,
-    CMD_GET_PAIR_STATUS,
     CMD_GET_STATUS,
     CMD_PAIR_CONFIRM,
     CMD_PAIR_INIT,
-    DEVICE_ID_LEN,
-    HMAC_FULL_LEN,
-    HMAC_TRUNCATED_LEN,
-    NONCE_LEN,
-    RANDOM_LEN,
+    CMD_PAIR_STATUS,
+    COMPRESSED_PUBKEY_LEN,
+    FP_GATE_MAX_FAILURES,
     SERVICE_UUID,
-    STATUS_INVALID_STATE,
+    STATUS_BUSY,
+    STATUS_ERROR,
+    STATUS_FP_GATE_APPROVED,
+    STATUS_FP_NOT_MATCH,
+    STATUS_INVALID_PARAM,
     STATUS_OK,
     STATUS_TIMEOUT,
-    STATUS_WAIT_BUTTON,
     STATUS_WAIT_FP,
 )
 from .security import (
     PairingData,
-    compute_cmd_hmac,
     derive_shared_key,
-    get_host_id,
-    verify_auth_response,
+    ecdh_shared_secret,
+    generate_p256_keypair,
     verify_fp_match_signed,
 )
 
@@ -67,12 +60,19 @@ log = logging.getLogger("immurok.ble")
 
 
 class BLEError(Exception):
-    """BLE 操作错误"""
+    pass
+
+
+class PairingError(Exception):
+    pass
+
+
+class AuthError(Exception):
     pass
 
 
 class ImmurokBLE:
-    """ESP32H2 immurok 设备 BLE 通信 — 通过 BlueZ D-Bus 直接访问 GATT"""
+    """immurok 设备 BLE 通信 — 通过 BlueZ D-Bus 直接访问 GATT"""
 
     def __init__(self) -> None:
         # D-Bus 连接与 GATT 接口
@@ -86,20 +86,28 @@ class ImmurokBLE:
         self._reconnect_enabled = True
         self._pairing: Optional[PairingData] = None
 
-        # 异步事件：命令响应（通过通知接收）
+        # 命令响应（通过通知接收）
         self._cmd_event = asyncio.Event()
         self._cmd_response: Optional[bytes] = None
 
-        # 异步事件：AUTH_RESPONSE 通知
+        # FP-gate 完成事件
+        self._gate_event = asyncio.Event()
+        self._gate_result: Optional[tuple] = None  # (success, data_or_error)
+        self._gate_pending = False
+        self._pair_fp_gate = False  # 配对 FP-gate 模式：ACK 不验证 HMAC
+
+        # AUTH 完成事件
         self._auth_event = asyncio.Event()
-        self._auth_result: Optional[tuple] = None  # (success, ...)
+        self._auth_result: Optional[bool] = None
         self._auth_pending = False
+        self._auth_failures = 0
 
         # 回调
         self.on_connected: Optional[Callable[[], None]] = None
         self.on_disconnected: Optional[Callable[[], None]] = None
-        self.on_fp_match: Optional[Callable[[int, bool], None]] = None
+        self.on_fp_match: Optional[Callable[[int], None]] = None
         self.on_enroll_progress: Optional[Callable[[int, int, int], None]] = None
+        self.on_fp_attempt_failed: Optional[Callable[[int], None]] = None
 
         # 加载已有配对
         self._pairing = PairingData.load()
@@ -120,87 +128,122 @@ class ImmurokBLE:
 
     # ── 通知处理 ───────────────────────────────────────────────
 
-    def _on_notification(self, _sender: int, data: bytearray) -> None:
-        """RSP 特征值通知路由"""
+    def _on_notification(self, _sender, data: bytearray) -> None:
+        """RSP 特征值通知路由 — 按 docs/protocol.md 优先级处理"""
         length = len(data)
         if length == 0:
             return
 
         cmd = data[0]
 
-        # 签名指纹匹配 (配对后) — 15 字节 (CH592F 无 counter)
-        if cmd == CMD_FP_MATCH_SIGNED and length == 15:
+        # 1. 签名 FP 匹配通知: [0x21][page_id:2B LE][hmac:8B] = 11 字节
+        if cmd == CMD_FP_MATCH_SIGNED and length == 11:
             self._handle_fp_match_signed(data)
             return
 
-        # 未签名指纹匹配 (未配对) — 3 字节
-        if cmd == CMD_FP_MATCHED and length == 3:
-            self._handle_fp_matched(data)
-            return
-
-        # 录入进度 — 4 字节
+        # 2. 录入进度通知: [0x11][status:1B][current:1B][total:1B] = 4 字节
         if cmd == CMD_ENROLL_STATUS and length == 4:
             self._handle_enroll_status(data)
             return
 
-        # AUTH_RESPONSE 成功 — 9 字节: [0x00][hmac:8] (CH592F 无 counter)
-        if cmd == STATUS_OK and length == 9 and self._auth_pending:
-            hmac_val = bytes(data[1:9])
-            self._auth_result = (True, hmac_val)
-            self._auth_event.set()
+        # 3. FP-gate: 指纹验证通过 (0x10, 1 字节)
+        if cmd == STATUS_FP_GATE_APPROVED and length == 1 and (
+            self._gate_pending or self._pair_fp_gate
+        ):
+            log.debug("FP-gate: 指纹验证通过，等待操作完成")
+            return  # 操作仍在进行，继续等待
+
+        # 4. FP 不匹配 (0x07, 1 字节) — gate 或 AUTH
+        if cmd == STATUS_FP_NOT_MATCH and length == 1:
+            if self._gate_pending:
+                self._auth_failures += 1
+                remaining = FP_GATE_MAX_FAILURES - self._auth_failures
+                log.warning("FP-gate: 指纹不匹配 (剩余 %d 次)", remaining)
+                if self.on_fp_attempt_failed:
+                    self.on_fp_attempt_failed(remaining)
+                if remaining <= 0:
+                    self._gate_result = (False, STATUS_FP_NOT_MATCH)
+                    self._gate_event.set()
+                return
+            if self._auth_pending:
+                self._auth_failures += 1
+                remaining = FP_GATE_MAX_FAILURES - self._auth_failures
+                log.warning("AUTH: 指纹不匹配 (剩余 %d 次)", remaining)
+                if self.on_fp_attempt_failed:
+                    self.on_fp_attempt_failed(remaining)
+                if remaining <= 0:
+                    self._auth_result = False
+                    self._auth_event.set()
+                return
+
+        # 5. 操作成功 (0x00, 1 字节) — gate 或 AUTH
+        if cmd == STATUS_OK and length == 1:
+            if self._gate_pending:
+                self._gate_result = (True, None)
+                self._gate_event.set()
+                return
+            if self._auth_pending:
+                self._auth_result = True
+                self._auth_event.set()
+                return
+
+        # 6. 错误状态 (gate 进行中)
+        if length == 1 and self._gate_pending and cmd in (
+            STATUS_TIMEOUT, STATUS_INVALID_PARAM, STATUS_ERROR
+        ):
+            log.warning("FP-gate 错误: 0x%02x", cmd)
+            self._gate_result = (False, cmd)
+            self._gate_event.set()
             return
 
-        # AUTH 错误 (1 字节状态码，auth 进行中)
-        if length == 1 and self._auth_pending and cmd != STATUS_OK:
-            log.warning("AUTH 错误通知: 0x%02x", cmd)
-            self._auth_result = (False, cmd)
-            self._auth_event.set()
-            return
-
-        # 其他通知视为命令响应
+        # 7. 其他通知 → 命令响应
         log.debug("命令响应通知: cmd=0x%02x len=%d data=%s",
                   cmd, length, data.hex())
         self._cmd_response = bytes(data)
         self._cmd_event.set()
 
     def _handle_fp_match_signed(self, data: bytearray) -> None:
-        """处理签名指纹匹配通知 [0x21][page_id:2][ts:4][hmac:8] (CH592F 无 counter)"""
+        """处理签名 FP 通知 [0x21][page_id:2B LE][hmac:8B] (11 字节)"""
         page_id = struct.unpack_from("<H", data, 1)[0]
-        timestamp = struct.unpack_from("<I", data, 3)[0]
-        hmac_val = bytes(data[7:15])
+        hmac_val = bytes(data[3:11])
+
+        # 配对 FP-gate：跳过 HMAC 验证，直接 ACK
+        # （重新配对时旧密钥可能已丢失，无法验证）
+        if self._pair_fp_gate:
+            log.info("配对 FP-gate: page_id=%d (跳过 HMAC 验证)", page_id)
+            try:
+                asyncio.get_running_loop().create_task(
+                    self._send_fp_match_ack()
+                )
+            except RuntimeError:
+                pass
+            return
 
         if self._pairing is None:
             log.warning("收到签名 FP 通知但未配对，忽略")
             return
 
-        # HMAC 验证
         if not verify_fp_match_signed(
-            self._pairing.shared_key, page_id, timestamp, hmac_val
+            self._pairing.shared_key, page_id, hmac_val
         ):
             log.warning("FP 通知 HMAC 验证失败 (page_id=%d)", page_id)
             return
 
         log.info("指纹匹配 (签名): page_id=%d", page_id)
-        # 发送 ACK 给固件
+
+        # 发送 ACK
         try:
             asyncio.get_running_loop().create_task(self._send_fp_match_ack())
         except RuntimeError:
-            pass  # 无 running loop (测试环境)
-        if self.on_fp_match:
-            self.on_fp_match(page_id, True)
+            pass
 
-    def _handle_fp_matched(self, data: bytearray) -> None:
-        """处理未签名指纹匹配通知 [0x20][page_id:2 LE]"""
-        if self._pairing is not None:
-            log.warning("已配对但收到未签名 FP 通知，忽略")
-            return
-        page_id = struct.unpack_from("<H", data, 1)[0]
-        log.info("指纹匹配 (未签名): page_id=%d", page_id)
+        # FP-gate 中收到 FP 匹配 → 等待设备执行结果（不在此处 set gate_event）
+
         if self.on_fp_match:
-            self.on_fp_match(page_id, False)
+            self.on_fp_match(page_id)
 
     def _handle_enroll_status(self, data: bytearray) -> None:
-        """处理录入进度通知 [0x11][status:1][current:1][total:1]"""
+        """处理录入进度通知 [0x11][status:1B][current:1B][total:1B]"""
         status, current, total = data[1], data[2], data[3]
         log.info("录入进度: status=%d, %d/%d", status, current, total)
         if self.on_enroll_progress:
@@ -209,9 +252,8 @@ class ImmurokBLE:
     # ── FP_MATCH_ACK ────────────────────────────────────────────
 
     async def _send_fp_match_ack(self) -> None:
-        """发送 FP_MATCH_ACK [0x22][0x00] 确认收到签名指纹匹配。"""
+        """发送 FP_MATCH_ACK [0x22][0x00]"""
         if not self._connected or not self._cmd_iface:
-            log.warning("无法发送 FP_MATCH_ACK: 未连接")
             return
         try:
             data = bytes([CMD_FP_MATCH_ACK, 0x00])
@@ -220,15 +262,13 @@ class ImmurokBLE:
         except Exception:
             log.warning("FP_MATCH_ACK 发送失败", exc_info=True)
 
-    # ── 命令发送 (write CMD + read RSP via D-Bus) ──────────────
+    # ── 命令发送 ──────────────────────────────────────────────
 
     async def send_command(self, cmd: int, payload: bytes = b"",
                           timeout: float = BLE_COMMAND_TIMEOUT) -> bytes:
         """
         发送命令并等待响应通知。
-
-        固件命令格式: [CMD:1][LEN:1][PAYLOAD:N]
-        响应通过 RSP 特征值通知接收。
+        命令格式: [CMD:1][LEN:1][PAYLOAD:N]
         """
         if not self._connected or not self._cmd_iface:
             raise BLEError("未连接")
@@ -236,237 +276,268 @@ class ImmurokBLE:
         data = bytes([cmd, len(payload)]) + payload
         log.debug("发送命令: cmd=0x%02x payload=%s", cmd, payload.hex())
 
-        # 清空命令响应状态
         self._cmd_event.clear()
         self._cmd_response = None
 
         await self._cmd_iface.call_write_value(data, {})
 
-        # 等待通知带回响应
         try:
-            await asyncio.wait_for(
-                self._cmd_event.wait(), timeout=timeout
-            )
+            await asyncio.wait_for(self._cmd_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             raise BLEError(f"命令响应超时: cmd=0x{cmd:02x}")
 
-        response = self._cmd_response
-        log.debug("命令响应: %s", response.hex())
-        return response
+        return self._cmd_response
 
-    # ── 命令认证 ───────────────────────────────────────────────
+    # ── FP-gate 命令 ──────────────────────────────────────────
 
-    async def get_cmd_challenge(self) -> bytes:
-        """获取命令认证 challenge (8 字节)。"""
-        rsp = await self.send_command(CMD_GET_CMD_CHALLENGE)
-        if rsp[0] != STATUS_OK or len(rsp) < 1 + CHALLENGE_LEN:
-            raise BLEError(f"GET_CMD_CHALLENGE 失败: 0x{rsp[0]:02x}")
-        return bytes(rsp[1 : 1 + CHALLENGE_LEN])
-
-    async def send_authenticated_command(
-        self, cmd: int, payload: bytes = b""
-    ) -> bytes:
+    async def send_fp_gated_command(
+        self, cmd: int, payload: bytes = b"",
+        timeout: float = BLE_FP_GATE_TIMEOUT,
+    ) -> tuple[bool, Optional[int]]:
         """
-        发送需要命令认证的命令。
+        发送需要 FP-gate 的命令。
 
-        流程: GET_CMD_CHALLENGE → HMAC(cmd||payload||challenge) → 发送
-        认证后的 payload = original_payload + challenge(8) + hmac(8)
+        流程 (docs/protocol.md):
+        1. 发送命令
+        2. 响应 0x00 → 直接成功 (cooldown 内)
+        3. 响应 0x11 → 等待指纹
+        4. 设备发 0x21 通知 (FP 匹配) → App 发 0x22 ACK
+        5. 设备执行命令 → 发 0x00 (成功) 或错误码
+
+        返回 (success, error_code)。
         """
-        if self._pairing is None:
-            raise BLEError("未配对，无法执行认证命令")
+        rsp = await self.send_command(cmd, payload)
+        status = rsp[0]
 
-        challenge = await self.get_cmd_challenge()
-        hmac_val = compute_cmd_hmac(
-            self._pairing.shared_key, cmd, payload, challenge
-        )
+        if status == STATUS_OK:
+            return (True, None)
 
-        auth_payload = payload + challenge + hmac_val
-        return await self.send_command(cmd, auth_payload)
+        if status != STATUS_WAIT_FP:
+            return (False, status)
+
+        # 等待 FP-gate 完成
+        self._gate_event.clear()
+        self._gate_result = None
+        self._gate_pending = True
+        self._auth_failures = 0
+
+        try:
+            try:
+                await asyncio.wait_for(
+                    self._gate_event.wait(), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                return (False, STATUS_TIMEOUT)
+
+            if self._gate_result is None:
+                return (False, STATUS_ERROR)
+
+            return self._gate_result
+        finally:
+            self._gate_pending = False
 
     # ── 高层命令 ───────────────────────────────────────────────
 
-    async def get_status(self) -> int:
+    async def get_status(self) -> tuple[int, bool, int | None]:
+        """GET_STATUS → [0x00][fp_bitmap:1B][paired:1B][battery:1B]
+
+        返回 (bitmap, is_paired, battery_level)。
+        battery_level 可能为 None（旧固件不发电量）。
+        """
         rsp = await self.send_command(CMD_GET_STATUS)
-        return rsp[0]
+        if rsp[0] != STATUS_OK or len(rsp) < 3:
+            return (0, False, None)
+        bitmap = rsp[1]
+        is_paired = rsp[2] != 0
+        battery = rsp[3] if len(rsp) >= 4 else None
+        return (bitmap, is_paired, battery)
 
     async def get_pair_status(self) -> int:
-        rsp = await self.send_command(CMD_GET_PAIR_STATUS)
+        """PAIR_STATUS → [0x32][paired:1B]"""
+        rsp = await self.send_command(CMD_PAIR_STATUS)
+        if len(rsp) >= 2 and rsp[0] == CMD_PAIR_STATUS:
+            return rsp[1]
         return rsp[0]
 
     async def fp_list(self) -> int:
-        """获取指纹 bitmap。返回值每一位表示对应 slot 是否有指纹。"""
+        """FP_LIST → [0x00][bitmap:1B]。返回 bitmap。"""
         rsp = await self.send_command(CMD_FP_LIST)
         if rsp[0] != STATUS_OK or len(rsp) < 2:
             return 0
         return rsp[1]
 
-    async def enroll_start(self, slot_id: int) -> int:
-        """开始指纹录入（需命令认证）。成功返回 0x00。"""
-        rsp = await self.send_authenticated_command(
+    async def enroll_start(self, slot_id: int) -> tuple[bool, Optional[int]]:
+        """开始指纹录入 (FP-gated)。"""
+        return await self.send_fp_gated_command(
             CMD_ENROLL_START, bytes([slot_id])
         )
-        return rsp[0]
 
-    async def delete_fp(self, slot_id: int) -> int:
-        """删除指纹（需命令认证）。"""
-        rsp = await self.send_authenticated_command(
+    async def delete_fp(self, slot_id: int) -> tuple[bool, Optional[int]]:
+        """删除指纹 (FP-gated)。"""
+        return await self.send_fp_gated_command(
             CMD_DELETE_FP, bytes([slot_id])
         )
-        return rsp[0]
 
-    # ── 配对流程 ───────────────────────────────────────────────
+    # ── ECDH 配对流程 ────────────────────────────────────────
 
     async def pair(self) -> PairingData:
         """
-        执行完整配对流程。
+        执行 ECDH P-256 配对流程 (docs/security.md)。
 
-        1. 发送 PAIR_INIT [0x30][host_id:16]
-        2. 收到 [0x10][device_random:16]
-        3. 循环发送 PAIR_CONFIRM [0x31][host_random:16]
-           - 0x10/0xFD → 继续等待按钮
-           - 0x00 + device_id → 成功
-           - 0x06 → 超时
-        4. HKDF 推导共享密钥，持久化
+        1. PAIR_INIT [0x30][0x00] → [0x30][device_pubkey:33B]
+           (若设备已有指纹，会先 FP-gate: 0x11 → 触摸 → 0x21/ACK → 0x30)
+        2. App 生成 P-256 密钥对
+        3. PAIR_CONFIRM [0x31][app_pubkey:33B] → [0x31][0x00]
+        4. ECDH → HKDF → shared_key
+        5. 持久化
         """
-        host_id = get_host_id()
-        host_random = os.urandom(RANDOM_LEN)
-
         # Step 1: PAIR_INIT
-        rsp = await self.send_command(CMD_PAIR_INIT, host_id)
-        status = rsp[0]
-        if status != STATUS_WAIT_BUTTON:
-            raise PairingError(f"PAIR_INIT 失败: 0x{status:02x}")
-        if len(rsp) < 1 + RANDOM_LEN:
-            raise PairingError("PAIR_INIT 响应长度不足")
-        device_random = rsp[1 : 1 + RANDOM_LEN]
-
-        # Step 2: PAIR_CONFIRM 轮询 (等待用户按物理按钮)
-        log.info("等待设备按钮确认...")
-        device_id = None
-        for _ in range(BLE_PAIR_MAX_RETRIES):
-            await asyncio.sleep(BLE_PAIR_POLL_INTERVAL)
-
-            rsp = await self.send_command(CMD_PAIR_CONFIRM, host_random)
-            status = rsp[0]
-
-            if status == STATUS_OK and len(rsp) >= 1 + DEVICE_ID_LEN:
-                device_id = bytes(rsp[1 : 1 + DEVICE_ID_LEN])
-                break
-            elif status in (STATUS_WAIT_BUTTON, STATUS_INVALID_STATE):
-                continue
-            elif status == STATUS_TIMEOUT:
-                raise PairingError("配对超时 (设备端)")
-            else:
-                raise PairingError(f"PAIR_CONFIRM 失败: 0x{status:02x}")
-
-        if device_id is None:
-            raise PairingError("配对超时 (未在限时内按下按钮)")
-
-        # Step 3: 推导共享密钥 (Salt = host_id)
-        shared_key = derive_shared_key(host_random, device_random, host_id)
-
-        # Step 4: 持久化
-        pairing = PairingData(
-            device_id=device_id,
-            shared_key=shared_key,
-            host_id=host_id,
+        rsp = await self.send_command(
+            CMD_PAIR_INIT, b"", timeout=BLE_PAIR_TIMEOUT
         )
+
+        # FP-gated: 设备已有指纹，需先验证
+        if len(rsp) == 1 and rsp[0] == STATUS_WAIT_FP:
+            log.info("配对需要指纹验证，请触摸传感器")
+            rsp = await self._wait_pair_fp_gate()
+
+        if len(rsp) < 1 + COMPRESSED_PUBKEY_LEN or rsp[0] != CMD_PAIR_INIT:
+            raise PairingError(
+                f"PAIR_INIT 失败: len={len(rsp)}, data={rsp.hex()}"
+            )
+        device_pubkey = bytes(rsp[1 : 1 + COMPRESSED_PUBKEY_LEN])
+        log.info("收到设备公钥: %s", device_pubkey.hex()[:20] + "...")
+
+        # Step 2: 生成 App 密钥对
+        app_privkey, app_pubkey = generate_p256_keypair()
+
+        # Step 3: PAIR_CONFIRM
+        rsp = await self.send_command(
+            CMD_PAIR_CONFIRM, app_pubkey, timeout=BLE_PAIR_TIMEOUT
+        )
+        if len(rsp) < 2 or rsp[0] != CMD_PAIR_CONFIRM or rsp[1] != STATUS_OK:
+            raise PairingError(
+                f"PAIR_CONFIRM 失败: data={rsp.hex()}"
+            )
+
+        # Step 4: ECDH + HKDF
+        shared_secret = ecdh_shared_secret(app_privkey, device_pubkey)
+        shared_key = derive_shared_key(shared_secret)
+
+        # Step 5: 持久化
+        pairing = PairingData(shared_key=shared_key)
         pairing.save()
         self._pairing = pairing
-        log.info("配对成功: device_id=%s", device_id.hex())
+        log.info("ECDH 配对成功")
         return pairing
+
+    async def _wait_pair_fp_gate(self) -> bytes:
+        """
+        等待配对 FP-gate 完成。
+
+        流程: 0x11(WAIT_FP) → 用户触摸 → 0x21(FP 匹配,ACK) →
+              0x10(gate 通过) → [0x30][pubkey:33B]
+        0x10 会被通知处理器拦截，不会到达此处。
+        0x07(FP 不匹配) 会路由到 _cmd_event。
+        """
+        self._pair_fp_gate = True
+        self._auth_failures = 0
+
+        try:
+            while True:
+                self._cmd_event.clear()
+                self._cmd_response = None
+                try:
+                    await asyncio.wait_for(
+                        self._cmd_event.wait(), timeout=BLE_PAIR_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    raise PairingError("配对超时")
+
+                rsp = self._cmd_response
+                if rsp is None:
+                    raise PairingError("配对失败: 连接断开")
+
+                # FP 不匹配 → 计数，继续等待
+                if len(rsp) == 1 and rsp[0] == STATUS_FP_NOT_MATCH:
+                    self._auth_failures += 1
+                    remaining = FP_GATE_MAX_FAILURES - self._auth_failures
+                    log.warning("配对指纹不匹配 (剩余 %d 次)", remaining)
+                    if self.on_fp_attempt_failed:
+                        self.on_fp_attempt_failed(remaining)
+                    if remaining <= 0:
+                        raise PairingError("指纹验证失败次数过多")
+                    continue
+
+                # 其他错误
+                if len(rsp) == 1 and rsp[0] in (
+                    STATUS_TIMEOUT, STATUS_ERROR, STATUS_BUSY,
+                ):
+                    raise PairingError(
+                        f"配对 FP-gate 失败: 0x{rsp[0]:02x}"
+                    )
+
+                # 实际响应 (应为 [0x30][pubkey:33B])
+                return rsp
+        finally:
+            self._pair_fp_gate = False
 
     # ── AUTH_REQUEST 流程 ──────────────────────────────────────
 
     async def auth_request(self) -> bool:
         """
-        执行认证请求。等待用户触摸指纹传感器，验证响应 HMAC。
+        执行认证请求 (docs/protocol.md)。
 
-        CH592F 流程 (无 counter):
-        1. challenge = random(8)
-        2. 发送 [0x33][0x08][challenge:8]
-        3. 收到 [0x11][device_nonce:8]
-        4. 等待 AUTH_RESPONSE 通知 (最长 60 秒)
-        5. 收到 [0x00][hmac:8]
-        6. 验证 HMAC(challenge || device_nonce || "auth-ok") → True/False
+        1. 发送 [0x33][0x00]
+        2. 响应 [0x11] = WAIT_FP
+        3. 用户触摸传感器
+        4. 通知 [0x00] = 成功 / [0x07] = 不匹配
         """
         if self._pairing is None:
             raise AuthError("未配对")
 
-        challenge = os.urandom(CHALLENGE_LEN)
-        payload = challenge
+        rsp = await self.send_command(CMD_AUTH_REQUEST)
+        status = rsp[0]
+        if status != STATUS_WAIT_FP:
+            raise AuthError(f"AUTH_REQUEST 失败: 0x{status:02x}")
 
-        # 清空 auth 状态
+        log.info("等待指纹验证...")
         self._auth_event.clear()
         self._auth_result = None
         self._auth_pending = True
+        self._auth_failures = 0
 
         try:
-            # 发送 AUTH_REQUEST
-            rsp = await self.send_command(CMD_AUTH_REQUEST, payload)
-            status = rsp[0]
-            if status != STATUS_WAIT_FP:
-                raise AuthError(f"AUTH_REQUEST 失败: 0x{status:02x}")
-            if len(rsp) < 1 + NONCE_LEN:
-                raise AuthError("AUTH_REQUEST 响应长度不足")
-
-            device_nonce = bytes(rsp[1 : 1 + NONCE_LEN])
-            log.info("等待指纹验证...")
-
-            # 等待 AUTH_RESPONSE 通知
             try:
                 await asyncio.wait_for(
                     self._auth_event.wait(), timeout=BLE_AUTH_TIMEOUT
                 )
             except asyncio.TimeoutError:
-                raise AuthError("认证超时 (等待指纹)")
-
-            result = self._auth_result
-            if result is None or not result[0]:
-                error = result[1] if result and len(result) > 1 else "unknown"
-                log.warning("认证失败: %s", error)
+                log.warning("认证超时")
                 return False
 
-            # 验证 HMAC (CH592F: 无 counter)
-            _, resp_hmac = result
-            if not verify_auth_response(
-                self._pairing.shared_key,
-                challenge,
-                device_nonce,
-                resp_hmac,
-            ):
-                log.warning("AUTH_RESPONSE HMAC 验证失败")
+            if self._auth_result is True:
+                log.info("认证成功")
+                return True
+            else:
+                log.warning("认证失败")
                 return False
-
-            log.info("认证成功")
-            return True
-
         finally:
             self._auth_pending = False
 
     # ── 出厂重置 ───────────────────────────────────────────────
 
-    async def factory_reset(self, hmac: bytes = b"") -> int:
-        """
-        出厂重置。已配对时需提供 32 字节 HMAC。
-        返回状态码 (0x10=等待按钮确认)。
-        """
-        rsp = await self.send_command(CMD_FACTORY_RESET, hmac)
-        return rsp[0]
+    async def factory_reset(self) -> tuple[bool, Optional[int]]:
+        """出厂重置 (FP-gated)。"""
+        return await self.send_fp_gated_command(CMD_FACTORY_RESET)
 
-    # ── 连接管理 (D-Bus 直接访问 BlueZ GATT) ────────────────────
+    # ── 连接管理 ──────────────────────────────────────────────
 
     async def _attach_gatt(self, device_path: str, address: str) -> None:
-        """
-        通过 D-Bus 直接访问已连接设备的 GATT 服务。
-
-        不调用 BleakClient.connect()（在已连接 HID 设备上会卡住），
-        而是直接通过 BlueZ D-Bus API 访问 GattCharacteristic1 接口。
-        """
+        """通过 D-Bus 直接访问已连接设备的 GATT 服务。"""
         bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
 
         try:
-            # 枚举 BlueZ 管理的所有对象，找到我们的 GATT 特征
             introspection = await bus.introspect("org.bluez", "/")
             obj = bus.get_proxy_object("org.bluez", "/", introspection)
             manager = obj.get_interface(
@@ -498,28 +569,27 @@ class ImmurokBLE:
 
             log.debug("GATT 特征: CMD=%s, RSP=%s", cmd_path, rsp_path)
 
-            # 获取 CMD 特征接口
+            # CMD 特征接口
             cmd_intro = await bus.introspect("org.bluez", cmd_path)
             cmd_obj = bus.get_proxy_object("org.bluez", cmd_path, cmd_intro)
             self._cmd_iface = cmd_obj.get_interface(
                 "org.bluez.GattCharacteristic1"
             )
 
-            # 获取 RSP 特征接口 + 订阅通知
+            # RSP 特征接口 + 订阅通知
             rsp_intro = await bus.introspect("org.bluez", rsp_path)
             rsp_obj = bus.get_proxy_object("org.bluez", rsp_path, rsp_intro)
             self._rsp_iface = rsp_obj.get_interface(
                 "org.bluez.GattCharacteristic1"
             )
 
-            # RSP PropertiesChanged → 通知回调
             rsp_props = rsp_obj.get_interface(
                 "org.freedesktop.DBus.Properties"
             )
             rsp_props.on_properties_changed(self._on_rsp_properties_changed)
             await self._rsp_iface.call_start_notify()
 
-            # 设备 PropertiesChanged → 断线检测
+            # 设备断线检测
             dev_intro = await bus.introspect("org.bluez", device_path)
             dev_obj = bus.get_proxy_object(
                 "org.bluez", device_path, dev_intro
@@ -547,7 +617,6 @@ class ImmurokBLE:
     def _on_rsp_properties_changed(
         self, interface: str, changed: dict, invalidated: list
     ) -> None:
-        """RSP 特征值 PropertiesChanged → 通知路由"""
         if interface != "org.bluez.GattCharacteristic1":
             return
         if "Value" not in changed:
@@ -560,7 +629,6 @@ class ImmurokBLE:
     def _on_device_properties_changed(
         self, interface: str, changed: dict, invalidated: list
     ) -> None:
-        """设备 PropertiesChanged → 断线检测"""
         if interface != "org.bluez.Device1":
             return
         if "Connected" not in changed:
@@ -572,7 +640,6 @@ class ImmurokBLE:
             self._handle_disconnect()
 
     def _handle_disconnect(self) -> None:
-        """处理断线（D-Bus 通知或主动断开）"""
         if not self._connected:
             return
         self._connected = False
@@ -580,25 +647,22 @@ class ImmurokBLE:
         self._rsp_iface = None
         self._device_path = None
         self._device_address = None
-        # 关闭 D-Bus 连接
         if self._bus:
             self._bus.disconnect()
             self._bus = None
         log.info("连接断开")
         if self.on_disconnected:
             self.on_disconnected()
-        # 唤醒等待中的 auth
+        # 唤醒等待中的 gate/auth
+        if self._gate_pending:
+            self._gate_result = (False, "disconnected")
+            self._gate_event.set()
         if self._auth_pending:
-            self._auth_result = (False, "disconnected")
+            self._auth_result = False
             self._auth_event.set()
 
     async def scan_and_connect(self) -> None:
-        """
-        查找并连接 immurok 设备，断线自动重连。
-
-        设备作为 HID 键盘已由 BlueZ 管理连接，daemon 通过 D-Bus
-        查找已连接的 immurok 设备并直接访问其 GATT 服务。
-        """
+        """查找并连接 immurok 设备，断线自动重连。"""
         while self._reconnect_enabled:
             try:
                 result = await self._find_connected_device()
@@ -608,7 +672,6 @@ class ImmurokBLE:
                         "在 BlueZ 已连接设备中找到 immurok: %s", address
                     )
                     await self._attach_gatt(device_path, address)
-                    # 保持连接直到断开
                     while self._connected:
                         await asyncio.sleep(1.0)
                 else:
@@ -624,11 +687,7 @@ class ImmurokBLE:
     async def _find_connected_device(
         self,
     ) -> Optional[tuple[str, str]]:
-        """
-        在 BlueZ 已连接设备中查找 immurok。
-
-        返回 (address, dbus_device_path) 元组，未找到返回 None。
-        """
+        """在 BlueZ 已连接设备中查找 immurok。"""
         try:
             bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
             try:
@@ -658,10 +717,6 @@ class ImmurokBLE:
                         and name.lower().startswith(BLE_DEVICE_NAME_PREFIX)
                         and connected
                     ):
-                        log.debug(
-                            "BlueZ 已连接设备: %s (%s) path=%s",
-                            name, address, path,
-                        )
                         return (address, path)
             finally:
                 bus.disconnect()
@@ -671,7 +726,6 @@ class ImmurokBLE:
         return None
 
     async def disconnect(self) -> None:
-        """主动断开 GATT 访问（不断开 HID 连接）。"""
         self._reconnect_enabled = False
         if self._rsp_iface and self._connected:
             try:
@@ -685,13 +739,3 @@ class ImmurokBLE:
 
     def disable_reconnect(self) -> None:
         self._reconnect_enabled = False
-
-
-# ── 异常 ───────────────────────────────────────────────────────
-
-class PairingError(Exception):
-    pass
-
-
-class AuthError(Exception):
-    pass

@@ -5,9 +5,9 @@ immurok TUI — 实时状态面板 + 键盘快捷键操作
 快捷键:
   p  配对        u  解除配对
   e  录入指纹    d  删除指纹
-  s  sudo 开关   o  polkit 开关
-  k  锁屏开关    l  查看日志
-  q  退出
+  v  验证指纹    s  sudo 开关
+  o  polkit 开关 k  锁屏开关
+  l  查看日志    q  退出
 
 指纹匹配时对应槽位自动闪烁。
 """
@@ -86,8 +86,9 @@ class ImmurokUI:
     def send(self, cmd: str, timeout: float = 5.0) -> str:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(timeout)
+        sock_path = os.path.expanduser(SOCKET_PATH)
         try:
-            sock.connect(SOCKET_PATH)
+            sock.connect(sock_path)
             sock.sendall(cmd.encode("utf-8"))
             data = sock.recv(256)
             return data.decode("utf-8").strip()
@@ -302,15 +303,16 @@ class ImmurokUI:
         # 快捷键栏
         if self.mode == "normal":
             keys = Text.assemble(
-                "  ", ("[p]", "bold cyan"), " \u914d\u5bf9  ",
-                ("[u]", "bold cyan"), " \u89e3\u9664  ",
-                ("[e]", "bold cyan"), " \u5f55\u5165  ",
-                ("[d]", "bold cyan"), " \u5220\u9664\n",
+                "  ", ("[p]", "bold cyan"), " 配对  ",
+                ("[u]", "bold cyan"), " 解除  ",
+                ("[e]", "bold cyan"), " 录入  ",
+                ("[d]", "bold cyan"), " 删除  ",
+                ("[v]", "bold cyan"), " 验证\n",
                 "  ", ("[s]", "bold cyan"), " sudo  ",
                 ("[o]", "bold cyan"), " polkit  ",
-                ("[k]", "bold cyan"), " \u9501\u5c4f\n",
-                "  ", ("[l]", "bold cyan"), " \u65e5\u5fd7  ",
-                ("[q]", "bold cyan"), " \u9000\u51fa",
+                ("[k]", "bold cyan"), " 锁屏\n",
+                "  ", ("[l]", "bold cyan"), " 日志  ",
+                ("[q]", "bold cyan"), " 退出",
             )
         elif self.mode in ("enroll_select", "delete_select"):
             action = "\u5f55\u5165" if self.mode == "enroll_select" else "\u5220\u9664"
@@ -348,12 +350,14 @@ class ImmurokUI:
                 live.update(self.render())
             elif key == "d":
                 if not self.ble_connected:
-                    self._set_msg("\u8bbe\u5907\u672a\u8fde\u63a5", "red bold")
+                    self._set_msg("设备未连接", "red bold")
                     live.update(self.render())
                     return
                 self.mode = "delete_select"
-                self._set_msg(f"\u6309 0-{MAX_FINGERPRINT_SLOTS - 1} \u9009\u62e9\u5220\u9664\u69fd\u4f4d", "yellow")
+                self._set_msg(f"按 0-{MAX_FINGERPRINT_SLOTS - 1} 选择删除槽位", "yellow")
                 live.update(self.render())
+            elif key == "v":
+                self._start_thread(self.do_verify, live)
             elif key == "s":
                 self._start_thread(self.do_toggle_sudo, live)
             elif key == "o":
@@ -398,11 +402,12 @@ class ImmurokUI:
             self.busy = False
             return
 
-        self._set_msg("配对中... 请按设备按钮", "yellow bold")
+        self._set_msg("配对中... 已有指纹时请触摸传感器", "yellow bold")
         live.update(self.render())
 
         rsp = self.send("PAIR:START", timeout=65.0)
         if rsp == "OK:PAIRED":
+            self.paired = True
             self._set_msg("配对成功!", "green bold")
         else:
             self._set_msg(f"配对失败: {rsp}", "red bold")
@@ -417,6 +422,7 @@ class ImmurokUI:
 
         rsp = self.send("PAIR:RESET", timeout=10.0)
         if rsp == "OK:RESET":
+            self.paired = False
             self._set_msg("配对已解除", "green bold")
         else:
             self._set_msg(f"解除失败: {rsp}", "red bold")
@@ -481,6 +487,32 @@ class ImmurokUI:
             self._set_msg("录入超时", "red bold")
             live.update(self.render())
             self.busy = False
+
+    def do_verify(self, live: Live) -> None:
+        self.busy = True
+        if not self.ble_connected:
+            self._set_msg("设备未连接", "red bold")
+            live.update(self.render())
+            self.busy = False
+            return
+        if not self.paired:
+            self._set_msg("设备未配对", "red bold")
+            live.update(self.render())
+            self.busy = False
+            return
+
+        self._set_msg("请触摸传感器验证指纹...", "yellow bold")
+        live.update(self.render())
+
+        rsp = self.send("FP:VERIFY", timeout=30.0)
+        if rsp == "OK:MATCH":
+            self._set_msg("指纹验证通过!", "green bold")
+        elif rsp == "OK:NO_MATCH":
+            self._set_msg("指纹不匹配", "red bold")
+        else:
+            self._set_msg(f"验证失败: {rsp}", "red bold")
+        live.update(self.render())
+        self.busy = False
 
     def do_delete(self, slot: int, live: Live) -> None:
         self.busy = True
