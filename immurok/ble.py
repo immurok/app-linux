@@ -12,7 +12,7 @@ import logging
 import struct
 from typing import Callable, Optional
 
-from dbus_fast import BusType
+from dbus_fast import BusType, Variant
 from dbus_fast.aio import MessageBus
 
 from .config import (
@@ -38,6 +38,8 @@ from .config import (
     CMD_PAIR_STATUS,
     COMPRESSED_PUBKEY_LEN,
     FP_GATE_MAX_FAILURES,
+    OTA_CHAR_UUID,
+    OTA_READ_POLL_INTERVAL,
     SERVICE_UUID,
     STATUS_BUSY,
     STATUS_ERROR,
@@ -81,10 +83,19 @@ class ImmurokBLE:
         self._device_address: Optional[str] = None
         self._cmd_iface = None   # GattCharacteristic1 for CMD
         self._rsp_iface = None   # GattCharacteristic1 for RSP
+        self._ota_iface = None   # GattCharacteristic1 for OTA (0xFEE1)
 
         self._connected = False
         self._reconnect_enabled = True
         self._pairing: Optional[PairingData] = None
+
+        # 连接参数 (固件通过 0xF0 通知上报)
+        self._conn_interval: int = 0   # 单位 1.25ms
+        self._conn_latency: int = 0
+        self._conn_timeout: int = 0    # 单位 10ms
+
+        # 固件版本 (GET_STATUS 返回)
+        self._firmware_version: Optional[str] = None
 
         # 命令响应（通过通知接收）
         self._cmd_event = asyncio.Event()
@@ -146,7 +157,19 @@ class ImmurokBLE:
             self._handle_enroll_status(data)
             return
 
-        # 3. FP-gate: 指纹验证通过 (0x10, 1 字节)
+        # 3. 连接参数更新通知: [0xF0][interval:2B BE][latency:1B][timeout:2B BE] = 6 字节
+        if cmd == 0xF0 and length == 6:
+            interval = (data[1] << 8) | data[2]
+            latency = data[3]
+            timeout = (data[4] << 8) | data[5]
+            self._conn_interval = interval
+            self._conn_latency = latency
+            self._conn_timeout = timeout
+            log.info("连接参数更新: interval=%d (%.2fms), latency=%d, timeout=%d (%dms)",
+                     interval, interval * 1.25, latency, timeout, timeout * 10)
+            return
+
+        # 4. FP-gate: 指纹验证通过 (0x10, 1 字节)
         if cmd == STATUS_FP_GATE_APPROVED and length == 1 and (
             self._gate_pending or self._pair_fp_gate
         ):
@@ -339,10 +362,11 @@ class ImmurokBLE:
     # ── 高层命令 ───────────────────────────────────────────────
 
     async def get_status(self) -> tuple[int, bool, int | None]:
-        """GET_STATUS → [0x00][fp_bitmap:1B][paired:1B][battery:1B]
+        """GET_STATUS → [0x00][fp_bitmap:1B][paired:1B][battery:1B][major][minor][patch][build_hi][build_lo]
 
         返回 (bitmap, is_paired, battery_level)。
         battery_level 可能为 None（旧固件不发电量）。
+        同时更新 firmware_version。
         """
         rsp = await self.send_command(CMD_GET_STATUS)
         if rsp[0] != STATUS_OK or len(rsp) < 3:
@@ -350,6 +374,11 @@ class ImmurokBLE:
         bitmap = rsp[1]
         is_paired = rsp[2] != 0
         battery = rsp[3] if len(rsp) >= 4 else None
+        if len(rsp) >= 9:
+            build = (rsp[7] << 8) | rsp[8]
+            self._firmware_version = f"{rsp[4]}.{rsp[5]}.{rsp[6]}.{build:x}"
+        elif len(rsp) >= 7:
+            self._firmware_version = f"{rsp[4]}.{rsp[5]}.{rsp[6]}"
         return (bitmap, is_paired, battery)
 
     async def get_pair_status(self) -> int:
@@ -380,7 +409,7 @@ class ImmurokBLE:
 
     # ── ECDH 配对流程 ────────────────────────────────────────
 
-    async def pair(self) -> PairingData:
+    async def pair(self, _retries: int = 3) -> PairingData:
         """
         执行 ECDH P-256 配对流程 (docs/security.md)。
 
@@ -396,10 +425,26 @@ class ImmurokBLE:
             CMD_PAIR_INIT, b"", timeout=BLE_PAIR_TIMEOUT
         )
 
+        # 0xE1 = BLE supervision timeout 不足，固件已请求参数更新，等待后重试
+        if len(rsp) == 1 and rsp[0] == 0xE1:
+            if _retries > 0:
+                log.warning("PAIR_INIT 被拒 (连接参数不足)，5s 后重试 (剩余 %d 次)", _retries)
+                await asyncio.sleep(5.0)
+                return await self.pair(_retries=_retries - 1)
+            raise PairingError("PAIR_INIT 失败: BLE 连接参数更新未完成")
+
         # FP-gated: 设备已有指纹，需先验证
         if len(rsp) == 1 and rsp[0] == STATUS_WAIT_FP:
             log.info("配对需要指纹验证，请触摸传感器")
             rsp = await self._wait_pair_fp_gate()
+
+        # 0xE1 也可能在 FP-gate 之后返回（gate 通过后固件才检查连接参数）
+        if len(rsp) == 1 and rsp[0] == 0xE1:
+            if _retries > 0:
+                log.warning("PAIR_INIT 被拒 (连接参数不足)，5s 后重试 (剩余 %d 次)", _retries)
+                await asyncio.sleep(5.0)
+                return await self.pair(_retries=_retries - 1)
+            raise PairingError("PAIR_INIT 失败: BLE 连接参数更新未完成")
 
         if len(rsp) < 1 + COMPRESSED_PUBKEY_LEN or rsp[0] != CMD_PAIR_INIT:
             raise PairingError(
@@ -531,6 +576,43 @@ class ImmurokBLE:
         """出厂重置 (FP-gated)。"""
         return await self.send_fp_gated_command(CMD_FACTORY_RESET)
 
+    # ── OTA 方法 ───────────────────────────────────────────────
+
+    @property
+    def ota_available(self) -> bool:
+        return self._connected and self._ota_iface is not None
+
+    async def ota_write_and_read(
+        self, data: bytes, timeout: float = 5.0,
+        poll_interval: float = OTA_READ_POLL_INTERVAL,
+    ) -> Optional[bytes]:
+        """写入 OTA 特征并轮询读取响应（用于需要回复的命令）"""
+        if not self._ota_iface:
+            return None
+        await self._ota_iface.call_write_value(data, {})
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            await asyncio.sleep(poll_interval)
+            try:
+                result = await self._ota_iface.call_read_value({})
+                if result and len(result) > 0:
+                    return bytes(result)
+            except Exception:
+                pass
+        return None
+
+    async def ota_write(self, data: bytes) -> bool:
+        """写入 OTA 特征（write-with-response，等待 BLE 确认）"""
+        if not self._ota_iface:
+            return False
+        try:
+            await self._ota_iface.call_write_value(data, {})
+            return True
+        except Exception:
+            log.warning("OTA write 失败", exc_info=True)
+            return False
+
     # ── 连接管理 ──────────────────────────────────────────────
 
     async def _attach_gatt(self, device_path: str, address: str) -> None:
@@ -547,6 +629,7 @@ class ImmurokBLE:
 
             cmd_path = None
             rsp_path = None
+            ota_path = None
             for path, interfaces in objects.items():
                 if not path.startswith(device_path):
                     continue
@@ -560,6 +643,8 @@ class ImmurokBLE:
                     cmd_path = path
                 elif uuid.lower() == CHAR_RSP_UUID:
                     rsp_path = path
+                elif uuid.lower() == OTA_CHAR_UUID:
+                    ota_path = path
 
             if not cmd_path or not rsp_path:
                 bus.disconnect()
@@ -588,6 +673,19 @@ class ImmurokBLE:
             )
             rsp_props.on_properties_changed(self._on_rsp_properties_changed)
             await self._rsp_iface.call_start_notify()
+
+            # OTA 特征接口 (可选)
+            if ota_path:
+                ota_intro = await bus.introspect("org.bluez", ota_path)
+                ota_obj = bus.get_proxy_object(
+                    "org.bluez", ota_path, ota_intro
+                )
+                self._ota_iface = ota_obj.get_interface(
+                    "org.bluez.GattCharacteristic1"
+                )
+                log.info("OTA 特征已发现: %s", ota_path)
+            else:
+                log.debug("未发现 OTA 特征")
 
             # 设备断线检测
             dev_intro = await bus.introspect("org.bluez", device_path)
@@ -645,8 +743,13 @@ class ImmurokBLE:
         self._connected = False
         self._cmd_iface = None
         self._rsp_iface = None
+        self._ota_iface = None
         self._device_path = None
         self._device_address = None
+        self._conn_interval = 0
+        self._conn_latency = 0
+        self._conn_timeout = 0
+        self._firmware_version = None
         if self._bus:
             self._bus.disconnect()
             self._bus = None

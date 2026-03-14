@@ -73,7 +73,8 @@ install: $(TARGET)
 	@mkdir -p $(SYSTEMD_DIR)
 	@cp immurok-daemon.service $(SYSTEMD_DIR)/
 	@systemctl --user daemon-reload
-	@systemctl --user enable --now immurok-daemon.service
+	@systemctl --user enable immurok-daemon.service
+	@systemctl --user restart immurok-daemon.service
 	@echo -e "$(G)[✓]$(N) daemon 已启动"
 	@# ── 完成 ──
 	@echo

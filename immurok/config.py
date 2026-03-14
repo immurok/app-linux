@@ -82,3 +82,12 @@ FP_GATE_MAX_FAILURES = 3         # 最多 3 次指纹不匹配
 
 # ── 最大指纹槽位 ─────────────────────────────────────────────
 MAX_FINGERPRINT_SLOTS = 5        # 固件 FP_MAX_SLOTS (CH592F: 0-4)
+
+# ── OTA BLE UUID ──────────────────────────────────────────────
+OTA_CHAR_UUID = "0000fee1-0000-1000-8000-00805f9b34fb"
+
+# ── OTA 常量 ─────────────────────────────────────────────────
+IMAGE_B_BLOCKS = 54              # 216KB / 4KB
+OTA_READ_POLL_INTERVAL = 0.2     # OTA 读取轮询间隔 (秒)
+OTA_ERASE_TIMEOUT = 15.0         # 擦除超时 (秒)
+OTA_SESSION_TIMEOUT = 30.0       # OTA 会话命令间超时 (秒)

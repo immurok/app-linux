@@ -6,6 +6,7 @@ immurok Unix Socket 服务器 — PAM / CLI 通信
 """
 
 import asyncio
+import base64
 import logging
 import os
 import subprocess
@@ -14,7 +15,10 @@ from typing import TYPE_CHECKING
 
 from .config import (
     ENROLL_COMPLETE,
+    IMAGE_B_BLOCKS,
     MAX_FINGERPRINT_SLOTS,
+    OTA_ERASE_TIMEOUT,
+    OTA_SESSION_TIMEOUT,
     PAM_TIMEOUT,
     PRE_AUTH_DURATION,
     SOCKET_PATH,
@@ -203,7 +207,10 @@ class SocketServer:
             parts = request.split(":")
             cmd = parts[0]
 
-            if cmd == "STATUS":
+            if cmd == "OTA":
+                await self._handle_ota_session(reader, writer, parts)
+                return
+            elif cmd == "STATUS":
                 response = self._handle_status()
             elif cmd == "AUTH":
                 response = await self._handle_auth(parts, reader)
@@ -215,6 +222,8 @@ class SocketServer:
                 response = self._handle_set(parts)
             elif cmd == "GET" and len(parts) >= 2 and parts[1] == "SETTINGS":
                 response = self._handle_get_settings()
+            elif cmd == "GET" and len(parts) >= 2 and parts[1] == "INFO":
+                response = self._handle_get_info()
             else:
                 response = "ERROR:UNKNOWN_COMMAND"
 
@@ -225,8 +234,11 @@ class SocketServer:
         except Exception:
             log.exception("处理客户端请求异常")
         finally:
-            writer.close()
-            await writer.wait_closed()
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
     # ── STATUS ───────────────────────────────────────────────────
 
@@ -533,3 +545,257 @@ class SocketServer:
             f":polkit={'1' if s.unlock_polkit else '0'}"
             f":screen={'1' if s.unlock_screen else '0'}"
         )
+
+    def _handle_get_info(self) -> str:
+        ble = self._ble
+        parts = ["OK"]
+        parts.append(f"fw={ble._firmware_version or '-'}")
+        parts.append(f"model=IK-1")
+        parts.append(f"addr={ble._device_address or '-'}")
+        parts.append(f"interval={ble._conn_interval}")
+        parts.append(f"latency={ble._conn_latency}")
+        parts.append(f"timeout={ble._conn_timeout}")
+        batt = self._battery_level
+        parts.append(f"battery={batt if batt is not None else -1}")
+        return ":".join(parts)
+
+    # ── OTA ────────────────────────────────────────────────────────
+
+    async def _handle_ota_session(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        first_parts: list[str],
+    ) -> None:
+        """OTA 升级会话（持久连接，\n 分隔协议）"""
+        log.info("OTA 会话开始")
+
+        async def send_line(line: str) -> None:
+            writer.write((line + "\n").encode())
+            await writer.drain()
+
+        # 处理第一个命令
+        response = await self._process_ota_command(first_parts)
+        await send_line(response)
+
+        if len(first_parts) >= 2 and first_parts[1] == "END":
+            log.info("OTA 会话结束")
+            return
+
+        # 持久连接：逐行读取后续命令
+        while True:
+            try:
+                line_data = await asyncio.wait_for(
+                    reader.readline(), timeout=OTA_SESSION_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                log.warning("OTA 会话超时")
+                break
+
+            if not line_data:
+                break
+
+            request = line_data.decode().strip()
+            if not request:
+                continue
+
+            parts = request.split(":")
+            response = await self._process_ota_command(parts)
+            await send_line(response)
+
+            if len(parts) >= 2 and parts[1] == "END":
+                break
+
+        log.info("OTA 会话结束")
+
+    async def _process_ota_command(self, parts: list[str]) -> str:
+        """处理单个 OTA 命令，返回响应字符串"""
+        if len(parts) < 2:
+            return "ERROR:INVALID_FORMAT"
+
+        sub = parts[1]
+        if sub != "WRITE":
+            log.info("OTA 命令: %s", sub)
+
+        if sub == "VERSION":
+            ver = self._ble._firmware_version or "unknown"
+            return f"OK:{ver}"
+        elif sub == "INFO":
+            return await self._handle_ota_info()
+        elif sub == "ERASE":
+            return await self._handle_ota_erase()
+        elif sub == "HEADER":
+            return await self._handle_ota_header(parts)
+        elif sub == "WRITE":
+            return await self._handle_ota_write(parts)
+        elif sub == "VERIFY":
+            return await self._handle_ota_verify(parts)
+        elif sub == "END":
+            return await self._handle_ota_end()
+        else:
+            return "ERROR:UNKNOWN_OTA_CMD"
+
+    async def _handle_ota_info(self) -> str:
+        if not self._ble.ota_available:
+            return "ERROR:OTA_NOT_AVAILABLE"
+
+        # CMD_IAP_INFO: [0x84, 0x02, 0x00, 0x00]
+        cmd = bytes([0x84, 0x02, 0x00, 0x00])
+        resp = await self._ble.ota_write_and_read(cmd, timeout=5.0)
+
+        if resp is None or len(resp) < 9:
+            return "ERROR:NO_RESPONSE"
+
+        image_flag = resp[0]
+        image_size = (
+            resp[1] | (resp[2] << 8) | (resp[3] << 16) | (resp[4] << 24)
+        )
+        block_size = resp[5] | (resp[6] << 8)
+        chip_id = resp[7] | (resp[8] << 8)
+
+        reply = (
+            f"OK:{image_flag:02x}:{image_size:08x}"
+            f":{block_size:04x}:{chip_id:04x}"
+        )
+        log.info("OTA INFO: %s", reply)
+        return reply
+
+    async def _handle_ota_erase(self) -> str:
+        if not self._ble.ota_available:
+            return "ERROR:OTA_NOT_AVAILABLE"
+
+        # CMD_IAP_ERASE: [0x81, 0x04, addr_lo, addr_hi, blocks_lo, blocks_hi]
+        cmd = bytes([
+            0x81, 0x04,
+            0x00, 0x00,
+            IMAGE_B_BLOCKS & 0xFF, (IMAGE_B_BLOCKS >> 8) & 0xFF,
+        ])
+        resp = await self._ble.ota_write_and_read(
+            cmd, timeout=OTA_ERASE_TIMEOUT
+        )
+
+        if resp is None or len(resp) < 1:
+            return "ERROR:ERASE_TIMEOUT"
+
+        if resp[0] == 0x00:
+            log.info("OTA ERASE 成功")
+            return "OK"
+
+        log.warning("OTA ERASE 失败: 0x%02x", resp[0])
+        return f"ERROR:ERASE_FAILED:{resp[0]:02x}"
+
+    async def _handle_ota_header(self, parts: list[str]) -> str:
+        if len(parts) < 3:
+            return "ERROR:INVALID_FORMAT"
+        if not self._ble.ota_available:
+            return "ERROR:OTA_NOT_AVAILABLE"
+
+        try:
+            header_data = base64.b64decode(parts[2])
+        except Exception:
+            return "ERROR:INVALID_DATA"
+
+        if len(header_data) != 96:
+            return "ERROR:INVALID_HEADER_SIZE"
+
+        # CMD_IAP_HEADER: [0x85, 0x60, header_data...]
+        cmd = bytes([0x85, len(header_data)]) + header_data
+        resp = await self._ble.ota_write_and_read(cmd, timeout=5.0)
+
+        if resp is None or len(resp) < 1:
+            return "ERROR:HEADER_TIMEOUT"
+
+        if resp[0] == 0x00:
+            log.info("OTA HEADER 已接受")
+            return "OK"
+
+        log.warning("OTA HEADER 被拒绝: 0x%02x", resp[0])
+        return f"ERROR:HEADER_REJECTED:{resp[0]:02x}"
+
+    async def _handle_ota_write(self, parts: list[str]) -> str:
+        if len(parts) < 4:
+            return "ERROR:INVALID_FORMAT"
+        if not self._ble.ota_available:
+            return "ERROR:OTA_NOT_AVAILABLE"
+
+        try:
+            offset = int(parts[2], 16)
+        except ValueError:
+            return "ERROR:INVALID_OFFSET"
+
+        try:
+            data = base64.b64decode(parts[3])
+        except Exception:
+            return "ERROR:INVALID_DATA"
+
+        # 地址编码: encoded_addr = offset / 16
+        encoded_addr = offset // 16
+
+        # CMD_IAP_PROM: [0x80, data_len, addr_lo, addr_hi, data...]
+        cmd = bytes([
+            0x80,
+            len(data),
+            encoded_addr & 0xFF,
+            (encoded_addr >> 8) & 0xFF,
+        ]) + data
+
+        ok = await self._ble.ota_write(cmd)
+        return "OK" if ok else "ERROR:WRITE_FAILED"
+
+    async def _handle_ota_verify(self, parts: list[str]) -> str:
+        if len(parts) < 4:
+            return "ERROR:INVALID_FORMAT"
+        if not self._ble.ota_available:
+            return "ERROR:OTA_NOT_AVAILABLE"
+
+        try:
+            offset = int(parts[2], 16)
+        except ValueError:
+            return "ERROR:INVALID_OFFSET"
+
+        try:
+            data = base64.b64decode(parts[3])
+        except Exception:
+            return "ERROR:INVALID_DATA"
+
+        encoded_addr = offset // 16
+        # CMD_IAP_VERIFY: [0x82, data_len, addr_lo, addr_hi, data...]
+        cmd = bytes([
+            0x82,
+            len(data),
+            encoded_addr & 0xFF,
+            (encoded_addr >> 8) & 0xFF,
+        ]) + data
+
+        resp = await self._ble.ota_write_and_read(cmd, timeout=5.0)
+
+        if resp is None or len(resp) < 1:
+            return "ERROR:VERIFY_TIMEOUT"
+
+        if resp[0] == 0x00:
+            return "OK"
+
+        return f"ERROR:VERIFY_FAILED:{resp[0]:02x}"
+
+    async def _handle_ota_end(self) -> str:
+        if not self._ble.ota_available:
+            return "ERROR:OTA_NOT_AVAILABLE"
+
+        # CMD_IAP_END: [0x83, 0x02, 0x00, 0x00]
+        cmd = bytes([0x83, 0x02, 0x00, 0x00])
+        try:
+            resp = await self._ble.ota_write_and_read(cmd, timeout=5.0)
+        except Exception:
+            # 设备验证通过后立即重启，BLE 断连导致写入异常 — 视为成功
+            log.info("OTA END: 设备已重启 (连接断开)")
+            return "OK"
+
+        if resp is not None and len(resp) >= 1:
+            log.info("OTA END 响应: %s", resp.hex())
+            if resp[0] == 0xF1:
+                return "ERROR:SHA256_MISMATCH"
+            if resp[0] == 0xF2:
+                return "ERROR:HMAC_MISMATCH"
+
+        # 无响应或成功（设备已重启）
+        return "OK"
